@@ -7,7 +7,9 @@
 #include <vector>
 
 #include "lsm/config.hpp"
+#include "lsm/manifest.hpp"
 #include "lsm/memtable.hpp"
+#include "lsm/sstable.hpp"
 #include "lsm/wal.hpp"
 
 namespace lsm {
@@ -18,6 +20,8 @@ struct EngineRecovery {
     WalRecoveryReport wal;
     std::uint64_t memtable_keys  = 0;   // entries in the active memtable
     std::uint64_t memtable_bytes = 0;
+    std::uint64_t sst_count      = 0;   // live tables from the manifest
+    std::uint64_t tmp_files_removed = 0; // leftover *.sst.tmp cleaned up (3.9)
 };
 
 struct MemtableStats {
@@ -25,25 +29,32 @@ struct MemtableStats {
     std::uint64_t active_bytes           = 0;
     std::uint64_t immutables_count       = 0;
     std::uint64_t immutables_bytes_total = 0;
-    std::uint64_t flush_requested        = 0;   // pending flushes (Section 3 consumes these)
+    std::uint64_t flush_requested        = 0;   // rotations so far (cumulative)
 };
 
-// The storage engine facade. As of Section 2: Put/Delete append durably to
-// the WAL, then update the active memtable; Get reads active -> immutables
-// (newest->oldest), honoring tombstones. Reads are memory-only until
-// Section 4 (SSTable reader). Opening the engine replays the WAL to rebuild
-// the memtable, rotating with the same rules as the write path.
+struct SstStats {
+    std::uint64_t sst_count       = 0;
+    std::uint64_t sst_total_bytes = 0;
+    std::uint64_t newest_id       = 0;   // 0 = none
+};
+
+// The storage engine facade. As of Section 3: Put/Delete append durably to
+// the WAL, then update the active memtable; a live rotation also rolls the
+// WAL segment so cleanup boundaries stay tight. flush_pending writes
+// immutables to SSTables (temp + fsync + atomic rename + manifest), then
+// deletes WAL segments via the watermark policy (3.8): a segment whose max
+// seqNo <= the manifest's max flushed seqNo is fully covered by SSTables.
 //
-// Concurrency model (Section 2.8): single writer, no threads yet — every
-// public method assumes one caller. Rotation swaps the active table and
-// appends the frozen one to the immutable list.
+// Reads are still memory-only (active -> immutables, newest->oldest);
+// SSTable reads arrive in Section 4. NOTE the consequence: once data is
+// flushed and its WAL segments are deleted, Get cannot see it until then.
 class Engine {
 public:
     explicit Engine(Config config);
     ~Engine();
 
-    // Runs WAL recovery, rebuilding the memtable from replayed records.
-    // The report should be printed by the caller (Sections 1.8 / 2.7).
+    // Cleans *.sst.tmp leftovers, loads + validates the manifest, then runs
+    // WAL recovery, rebuilding the memtable from replayed records.
     EngineRecovery open();
 
     std::uint64_t put(std::string_view key, std::string_view value);  // returns seqNo
@@ -51,10 +62,16 @@ public:
     std::uint64_t remove(std::string_view key);                       // Delete; returns seqNo
     void close();
 
+    // Flush all pending immutables, oldest first (Section 3.4). Returns one
+    // result per table written; empty when nothing was pending.
+    std::vector<SstBuildResult> flush_pending();
+
     [[nodiscard]] const Config& config() const noexcept { return config_; }
     [[nodiscard]] bool closed() const noexcept { return closed_; }
     [[nodiscard]] WalStats wal_stats() const;
     [[nodiscard]] MemtableStats memtable_stats() const;
+    [[nodiscard]] SstStats sst_stats() const;
+    [[nodiscard]] const Manifest& manifest() const { return manifest_; }
 
 private:
     void ensure_open() const;
@@ -66,7 +83,8 @@ private:
     Config config_;
     std::unique_ptr<Wal> wal_;
     std::unique_ptr<Memtable> active_;
-    std::vector<std::unique_ptr<Memtable>> immutables_;  // oldest first
+    std::vector<std::unique_ptr<Memtable>> immutables_;   // oldest first
+    Manifest manifest_;
     std::uint64_t flush_requested_ = 0;
     bool backpressure_warned_ = false;
     bool closed_ = false;

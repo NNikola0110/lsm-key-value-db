@@ -22,6 +22,9 @@ struct Config {
     std::uint32_t memtable_size_overhead_bytes_per_entry = 32;  // accounting only (2.5)
     std::uint32_t block_size            = 8192;       // 8 KiB, target SSTable block size
     double        bloom_false_positive  = 0.01;       // target Bloom FP rate
+    std::string   sst_dir               = "";         // empty = <data_dir>/sst (Section 3.10)
+    std::uint32_t restart_interval      = 16;         // entries per restart point
+    std::uint32_t max_build_buffer_mb   = 32;         // advisory cap while building SSTs
     std::uint32_t wal_fsync_every_n     = 1;          // fsync every N writes
     std::uint64_t wal_segment_roll_bytes = 134217728; // 128 MiB, size-based roll
     Compression   compression           = Compression::Off;
@@ -35,6 +38,11 @@ struct Config {
 
     void apply_env();                       // LSMKV_* overrides
     void print(std::ostream& os) const;     // resolved values, key=value per line
+
+    [[nodiscard]] std::filesystem::path resolved_sst_dir() const {
+        return sst_dir.empty() ? std::filesystem::path(data_dir) / "sst"
+                               : std::filesystem::path(sst_dir);
+    }
 };
 
 } // namespace lsm

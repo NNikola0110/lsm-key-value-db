@@ -83,6 +83,7 @@ Config Config::load(const std::filesystem::path& config_path) {
         static const std::set<std::string> known = {
             "data_dir", "memtable_max_bytes", "max_immutable_tables",
             "memtable_size_overhead_bytes_per_entry", "block_size", "bloom_false_positive",
+            "sst_dir", "restart_interval", "max_build_buffer_mb",
             "wal_fsync_every_n", "wal_segment_roll_bytes", "compression", "log_level",
         };
 
@@ -100,6 +101,9 @@ Config Config::load(const std::filesystem::path& config_path) {
                 cfg.memtable_size_overhead_bytes_per_entry = v.get<std::uint32_t>();
             else if (key == "block_size")          cfg.block_size = v.get<std::uint32_t>();
             else if (key == "bloom_false_positive") cfg.bloom_false_positive = v.get<double>();
+            else if (key == "sst_dir")             cfg.sst_dir = v.get<std::string>();
+            else if (key == "restart_interval")    cfg.restart_interval = v.get<std::uint32_t>();
+            else if (key == "max_build_buffer_mb") cfg.max_build_buffer_mb = v.get<std::uint32_t>();
             else if (key == "wal_fsync_every_n")   cfg.wal_fsync_every_n = v.get<std::uint32_t>();
             else if (key == "wal_segment_roll_bytes") cfg.wal_segment_roll_bytes = v.get<std::uint64_t>();
             else if (key == "compression")         cfg.compression = parse_compression(v.get<std::string>());
@@ -120,6 +124,9 @@ void Config::apply_env() {
         memtable_size_overhead_bytes_per_entry = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_BLOCK_SIZE"))           block_size = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_BLOOM_FALSE_POSITIVE")) bloom_false_positive = std::stod(*v);
+    if (auto v = env("LSMKV_SST_DIR"))              sst_dir = *v;
+    if (auto v = env("LSMKV_RESTART_INTERVAL"))     restart_interval = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_MAX_BUILD_BUFFER_MB"))  max_build_buffer_mb = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_WAL_FSYNC_EVERY_N"))    wal_fsync_every_n = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_WAL_SEGMENT_ROLL_BYTES")) wal_segment_roll_bytes = std::stoull(*v);
     if (auto v = env("LSMKV_COMPRESSION"))          compression = parse_compression(*v);
@@ -133,6 +140,9 @@ void Config::print(std::ostream& os) const {
        << "memtable_size_overhead_bytes_per_entry=" << memtable_size_overhead_bytes_per_entry << '\n'
        << "block_size="            << block_size                << '\n'
        << "bloom_false_positive="  << bloom_false_positive      << '\n'
+       << "sst_dir="               << resolved_sst_dir().string() << '\n'
+       << "restart_interval="      << restart_interval          << '\n'
+       << "max_build_buffer_mb="   << max_build_buffer_mb       << '\n'
        << "wal_fsync_every_n="     << wal_fsync_every_n         << '\n'
        << "wal_segment_roll_bytes=" << wal_segment_roll_bytes   << '\n'
        << "compression="           << to_string(compression)    << '\n'

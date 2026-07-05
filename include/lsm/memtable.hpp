@@ -29,6 +29,10 @@ public:
     // nullptr if the key has no entry (a tombstone IS an entry).
     [[nodiscard]] const MemEntry* find(std::string_view key) const;
 
+    using Map = std::map<std::string, MemEntry, std::less<>>;
+    // Key-ordered view for the flush path (Section 3): iterate ascending.
+    [[nodiscard]] const Map& sorted_entries() const noexcept { return map_; }
+
     [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
     [[nodiscard]] std::uint64_t entries() const noexcept { return map_.size(); }
 
@@ -38,7 +42,7 @@ private:
         return key.size() + value.size() + overhead_;
     }
 
-    std::map<std::string, MemEntry, std::less<>> map_;  // lexicographic key order
+    Map map_;  // lexicographic key order
     std::uint64_t bytes_ = 0;
     std::uint32_t overhead_;
 };

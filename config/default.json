@@ -5,6 +5,8 @@
   "memtable_size_overhead_bytes_per_entry": 32,
   "block_size": 8192,
   "bloom_false_positive": 0.01,
+  "restart_interval": 16,
+  "max_build_buffer_mb": 32,
   "wal_fsync_every_n": 1,
   "wal_segment_roll_bytes": 134217728,
   "compression": "off",

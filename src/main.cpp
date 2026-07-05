@@ -5,6 +5,7 @@
 #include "lsm/config.hpp"
 #include "lsm/engine.hpp"
 #include "lsm/errors.hpp"
+#include "lsm/sstable.hpp"
 #include "lsm/wal.hpp"
 
 #include <filesystem>
@@ -26,8 +27,11 @@ void print_usage(std::ostream& os) {
           "  put   --key K --value V    WAL append + memtable update\n"
           "  get   --key K              read from memtables, prints value or NOT FOUND\n"
           "  del   --key K              WAL append + memtable tombstone\n"
-          "  stats                      print config, WAL stats and engine status\n"
+          "  stats                      print config, WAL/memtable/SSTable stats\n"
           "  close                      finish appends, sync, exit cleanly\n"
+          "  flush-now                  flush pending immutable memtables to SSTables\n"
+          "  list-sst                   list live SSTables from the manifest\n"
+          "  verify-sst --file F        check footer magic and all block checksums\n"
           "  wal-verify                 scan WAL segments, print a recovery report (read-only)\n"
           "  wal-truncate --segment S --offset N   truncate a WAL segment (careful!)\n"
           "\n"
@@ -82,7 +86,12 @@ void open_engine(lsm::Engine& engine) {
     r.wal.print(std::cout);
     std::cout << "recovery: memtable_keys=" << r.memtable_keys
               << " memtable_bytes=" << r.memtable_bytes
-              << " last_seqno=" << r.wal.last_seqno << '\n';
+              << " last_seqno=" << r.wal.last_seqno
+              << " sst_count=" << r.sst_count;
+    if (r.tmp_files_removed > 0) {
+        std::cout << " tmp_files_removed=" << r.tmp_files_removed;
+    }
+    std::cout << '\n';
 }
 
 int run_mutation(const std::string& cmd,
@@ -132,8 +141,12 @@ int run_stats(const fs::path& config_path) {
               << "memtable.active_bytes="           << m.active_bytes << '\n'
               << "memtable.immutables_count="       << m.immutables_count << '\n'
               << "memtable.immutables_bytes_total=" << m.immutables_bytes_total << '\n'
-              << "memtable.flush_requested="        << m.flush_requested << '\n'
-              << "engine status: wal+memtable (flush to SSTables arrives in Section 3)\n";
+              << "memtable.flush_requested="        << m.flush_requested << '\n';
+    const lsm::SstStats t = engine.sst_stats();
+    std::cout << "sst.count="       << t.sst_count << '\n'
+              << "sst.total_bytes=" << t.sst_total_bytes << '\n'
+              << "sst.newest_id="   << t.newest_id << '\n'
+              << "engine status: wal+memtable+sst-writer (disk reads arrive in Section 4)\n";
     engine.close();
     return 0;
 }
@@ -203,6 +216,58 @@ int main(int argc, char** argv) {
             engine.close();
             std::cout << "closed ✓ (wal synced)\n";
             return 0;
+        }
+
+        if (cmd == "flush-now") {
+            lsm::Engine engine(lsm::Config::load(config_path));
+            open_engine(engine);
+            const auto results = engine.flush_pending();
+            if (results.empty()) {
+                std::cout << "nothing to flush (no immutable memtables)\n";
+            }
+            for (const auto& r : results) {
+                std::cout << "flushed " << r.file_name << " bytes=" << r.file_size
+                          << " entries=" << r.entries
+                          << " seqno=[" << r.min_seqno << ".." << r.max_seqno << "]\n";
+            }
+            engine.close();
+            return 0;
+        }
+
+        if (cmd == "list-sst") {
+            lsm::Engine engine(lsm::Config::load(config_path));
+            open_engine(engine);
+            const auto& tables = engine.manifest().tables();
+            if (tables.empty()) {
+                std::cout << "no live SSTables\n";
+            }
+            for (const auto& t : tables) {
+                std::cout << t.file_name << " size=" << t.file_size
+                          << " entries=" << t.entries
+                          << " keys=[" << t.min_key << ".." << t.max_key << "]"
+                          << " seqno=[" << t.min_seqno << ".." << t.max_seqno << "]"
+                          << " bloom=" << t.bloom_bits_per_key << "bits/key,k="
+                          << t.bloom_hashes
+                          << " created=" << t.created_at << '\n';
+            }
+            engine.close();
+            return 0;
+        }
+
+        if (cmd == "verify-sst") {
+            const auto file_it = flags.find("file");
+            if (file_it == flags.end() || file_it->second.empty()) {
+                throw lsm::Error(lsm::ErrorCode::InvalidArgument,
+                                 "--file is required for 'verify-sst'");
+            }
+            const lsm::Config cfg = lsm::Config::load(config_path);
+            fs::path target(file_it->second);
+            if (!target.has_parent_path()) {
+                target = cfg.resolved_sst_dir() / target;
+            }
+            const std::string verdict = lsm::verify_sstable(target);
+            std::cout << target.filename().string() << ": " << verdict << '\n';
+            return verdict == "OK" ? 0 : 1;
         }
 
         if (cmd == "wal-verify") {
