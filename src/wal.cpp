@@ -228,7 +228,7 @@ Wal::Wal(fs::path dir, std::uint32_t fsync_every_n, std::uint64_t roll_bytes)
 Wal::~Wal() {
     if (file_) {
         // Best effort only; explicit close() reports errors properly.
-        try { close(); } catch (...) {}
+        try { close_locked(); } catch (...) {}
     }
 }
 
@@ -299,6 +299,7 @@ std::uint64_t Wal::append_del(std::string_view key) {
 }
 
 std::uint64_t Wal::append(std::uint8_t type, std::string_view key, std::string_view value) {
+    std::lock_guard lock(mutex_);
     if (!file_) {
         throw Error(ErrorCode::StoreClosed, "WAL is not open");
     }
@@ -347,6 +348,7 @@ std::uint64_t Wal::append(std::uint8_t type, std::string_view key, std::string_v
 }
 
 std::uint64_t Wal::roll() {
+    std::lock_guard lock(mutex_);
     if (!file_) {
         throw Error(ErrorCode::StoreClosed, "WAL is not open");
     }
@@ -355,6 +357,7 @@ std::uint64_t Wal::roll() {
 }
 
 std::vector<std::string> Wal::remove_segments_covered(std::uint64_t watermark) {
+    std::lock_guard lock(mutex_);
     std::vector<std::string> deleted;
     for (const auto& [id, path] : list_segments(dir_)) {
         if (id == active_id_) continue;
@@ -375,20 +378,28 @@ std::vector<std::string> Wal::remove_segments_covered(std::uint64_t watermark) {
 }
 
 void Wal::sync() {
+    std::lock_guard lock(mutex_);
     if (file_) {
         fsync_file(file_, dir_ / segment_name(active_id_));
         appends_since_sync_ = 0;
     }
 }
 
-void Wal::close() {
+void Wal::close_locked() {
     if (!file_) return;
-    sync();
+    fsync_file(file_, dir_ / segment_name(active_id_));
+    appends_since_sync_ = 0;
     std::fclose(file_);
     file_ = nullptr;
 }
 
+void Wal::close() {
+    std::lock_guard lock(mutex_);
+    close_locked();
+}
+
 WalStats Wal::stats() const {
+    std::lock_guard lock(mutex_);
     WalStats s;
     s.active_segment_id = active_id_;
     s.active_segment_bytes = active_bytes_;

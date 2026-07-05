@@ -99,7 +99,7 @@ Config Config::load(const std::filesystem::path& config_path) {
             "manifest_path", "publish_log_level",
             "size_tiered_fan_in", "size_tiered_size_ratio", "tombstone_grace_seconds",
             "compaction_max_concurrent", "compaction_io_mb_per_s",
-            "l0_compaction_trigger", "l0_stop_writes",
+            "l0_compaction_trigger", "l0_stop_writes", "bg_tick_ms", "shutdown_timeout_ms",
         };
 
         for (auto it = doc.begin(); it != doc.end(); ++it) {
@@ -135,6 +135,8 @@ Config Config::load(const std::filesystem::path& config_path) {
             else if (key == "compaction_io_mb_per_s") cfg.compaction_io_mb_per_s = v.get<std::uint32_t>();
             else if (key == "l0_compaction_trigger") cfg.l0_compaction_trigger = v.get<std::uint32_t>();
             else if (key == "l0_stop_writes")      cfg.l0_stop_writes = v.get<std::uint32_t>();
+            else if (key == "bg_tick_ms")          cfg.bg_tick_ms = v.get<std::uint32_t>();
+            else if (key == "shutdown_timeout_ms") cfg.shutdown_timeout_ms = v.get<std::uint32_t>();
         }
     }
     // Missing file falls through with defaults; both paths still honor env overrides.
@@ -170,6 +172,8 @@ void Config::apply_env() {
     if (auto v = env("LSMKV_COMPACTION_IO_MB_PER_S")) compaction_io_mb_per_s = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_L0_COMPACTION_TRIGGER")) l0_compaction_trigger = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_L0_STOP_WRITES"))       l0_stop_writes = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_BG_TICK_MS"))           bg_tick_ms = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_SHUTDOWN_TIMEOUT_MS"))  shutdown_timeout_ms = static_cast<std::uint32_t>(std::stoul(*v));
 }
 
 void Config::print(std::ostream& os) const {
@@ -197,7 +201,9 @@ void Config::print(std::ostream& os) const {
        << "compaction_max_concurrent=" << compaction_max_concurrent << '\n'
        << "compaction_io_mb_per_s=" << compaction_io_mb_per_s   << '\n'
        << "l0_compaction_trigger=" << l0_compaction_trigger     << '\n'
-       << "l0_stop_writes="        << l0_stop_writes            << '\n';
+       << "l0_stop_writes="        << l0_stop_writes            << '\n'
+       << "bg_tick_ms="            << bg_tick_ms                << '\n'
+       << "shutdown_timeout_ms="   << shutdown_timeout_ms       << '\n';
 }
 
 } // namespace lsm

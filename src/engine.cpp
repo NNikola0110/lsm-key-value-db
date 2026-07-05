@@ -35,7 +35,9 @@ std::string utc_now_iso8601() {
 
 Engine::Engine(Config config) : config_(std::move(config)) {}
 
-Engine::~Engine() = default;
+Engine::~Engine() {
+    stop_workers();
+}
 
 EngineRecovery Engine::open() {
     const fs::path sst_dir = config_.resolved_sst_dir();
@@ -111,12 +113,84 @@ EngineRecovery Engine::open() {
 
     // Startup publish (5.6): the first Version readers can use — manifest
     // tables plus the memtables rebuilt from the WAL.
-    publish_version("startup");
+    {
+        std::lock_guard st(state_mutex_);
+        publish_version("startup");
+    }
     recovery.epoch = manifest_.epoch();
-    recovery.version_published = current_version_->id;
+    recovery.version_published = current_version_.load()->id;
     return recovery;
 }
 
+void Engine::start_background() {
+    if (workers_running_) return;
+    stop_workers_ = false;
+    workers_running_ = true;
+    flush_thread_ = std::thread([this] { flush_worker_loop(); });
+    compact_thread_ = std::thread([this] { compaction_worker_loop(); });
+}
+
+void Engine::stop_workers() {
+    if (!workers_running_) return;
+    stop_workers_ = true;
+    state_cv_.notify_all();
+    if (flush_thread_.joinable()) flush_thread_.join();
+    if (compact_thread_.joinable()) compact_thread_.join();
+    workers_running_ = false;
+}
+
+void Engine::flush_worker_loop() {
+    while (!stop_workers_) {
+        bool had_work = false;
+        {
+            std::unique_lock st(state_mutex_);
+            state_cv_.wait_for(st, std::chrono::milliseconds(config_.bg_tick_ms),
+                               [&] { return stop_workers_.load() || !immutables_.empty(); });
+            had_work = !immutables_.empty();
+        }
+        if (stop_workers_ && !had_work) break;
+        if (had_work) {
+            try {
+                flush_one();
+            } catch (const Error& e) {
+                // 7.8: keep the immutable queued; it is retried next tick.
+                std::cerr << "flush: failed (" << to_string(e.code()) << "): "
+                          << e.what() << "; will retry\n";
+            }
+        }
+        if (stop_workers_) break;
+    }
+}
+
+void Engine::compaction_worker_loop() {
+    while (!stop_workers_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(config_.bg_tick_ms));
+        if (stop_workers_ || cancel_compaction_ || compaction_paused()) continue;
+
+        // Flush beats compaction (7.3): yield while flush work is queued.
+        {
+            std::lock_guard st(state_mutex_);
+            if (!immutables_.empty()) continue;
+            const auto pick = pick_compaction(manifest_.tables(), config_);
+            // Periodic tick only acts on a genuinely size-similar set; the
+            // fallback pick is reserved for the l0 trigger, otherwise the
+            // worker would grind every table set down to fan_in-1 files.
+            const bool triggered = manifest_.tables().size() >= config_.l0_compaction_trigger;
+            if (!pick || (!triggered && pick->reason != "size-similar window")) {
+                continue;
+            }
+        }
+        try {
+            run_compaction(std::nullopt);
+        } catch (const Error& e) {
+            // 7.8: abandon the job; inputs remain live. Retried next tick.
+            std::cerr << "compact: failed (" << to_string(e.code()) << "): "
+                      << e.what() << '\n';
+        }
+    }
+}
+
+// Caller must hold state_mutex_.
 void Engine::publish_version(const char* reason) {
     auto v = std::make_shared<Version>();
     v->id = ++version_id_;
@@ -124,11 +198,13 @@ void Engine::publish_version(const char* reason) {
     v->active = active_;
     v->immutables = immutables_;
     v->tables = readers_;
-    current_version_ = std::move(v);   // atomic pointer swap: readers holding
-                                       // the old Version keep using it (5.5)
+    const std::uint64_t id = v->id;
+    const std::uint64_t epoch = v->epoch;
+    current_version_.store(std::move(v));   // atomic swap: readers holding
+                                            // the old Version keep using it (5.5)
+    bg_.versions_published_total += 1;
     if (config_.publish_log_level == LogLevel::Debug) {
-        std::cerr << "publish: version=" << current_version_->id
-                  << " epoch=" << current_version_->epoch
+        std::cerr << "publish: version=" << id << " epoch=" << epoch
                   << " immutables=" << immutables_.size()
                   << " sst=" << readers_.size()
                   << " reason=" << reason << '\n';
@@ -136,7 +212,7 @@ void Engine::publish_version(const char* reason) {
 }
 
 void Engine::ensure_open() const {
-    if (closed_) {
+    if (closed_ || shutting_down_) {
         throw Error(ErrorCode::StoreClosed, "store is closed");
     }
     if (!wal_) {
@@ -144,10 +220,12 @@ void Engine::ensure_open() const {
     }
 }
 
-// Backpressure policy (2.6, Option A): if the active table is full and the
-// immutable list is at max_immutable_tables, refuse the write. flush-now
-// (Section 3) is the way out until background flushing exists (Section 7).
+// Backpressure (2.6 / 7.6). With background workers running, a full
+// immutable queue BLOCKS the writer until the FlushWorker frees a slot;
+// without workers (one-shot CLI) it throws, as in earlier sections.
 void Engine::ensure_write_capacity() {
+    std::unique_lock st(state_mutex_);
+
     // Optional write stall (6.8): too many SSTables means compaction has
     // fallen far behind; refuse writes loudly until it catches up.
     if (manifest_.tables().size() > config_.l0_stop_writes) {
@@ -157,16 +235,36 @@ void Engine::ensure_write_capacity() {
         throw Error(ErrorCode::Backpressure,
                     "too many SSTables; writes stalled until compaction runs");
     }
-    if (active_->bytes() >= config_.memtable_max_bytes &&
-        immutables_.size() >= config_.max_immutable_tables) {
-        std::cerr << "backpressure: immutables=" << immutables_.size()
-                  << " (max=" << config_.max_immutable_tables << "); blocking writes\n";
+
+    if (active_->bytes() < config_.memtable_max_bytes ||
+        immutables_.size() < config_.max_immutable_tables) {
+        return;
+    }
+
+    std::cerr << "stall: immutables=" << immutables_.size()
+              << " (max=" << config_.max_immutable_tables << ") blocking writes\n";
+    bg_.write_stalls_total += 1;
+
+    if (!workers_running_) {
         throw Error(ErrorCode::Backpressure,
                     "memtable full and immutable tables at limit; run flush-now");
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    state_cv_.wait(st, [&] {
+        return shutting_down_.load() || stop_workers_.load() ||
+               immutables_.size() < config_.max_immutable_tables;
+    });
+    bg_.stall_time_ms_total += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
+    if (shutting_down_ || stop_workers_) {
+        throw Error(ErrorCode::StoreClosed, "store shutting down during write stall");
     }
 }
 
 std::uint64_t Engine::put(std::string_view key, std::string_view value) {
+    std::lock_guard writer(write_mutex_);   // single-writer rule (7.4)
     ensure_open();
     if (key.empty()) {
         throw Error(ErrorCode::InvalidArgument, "empty key is not allowed");
@@ -178,6 +276,7 @@ std::uint64_t Engine::put(std::string_view key, std::string_view value) {
 }
 
 std::uint64_t Engine::remove(std::string_view key) {
+    std::lock_guard writer(write_mutex_);   // single-writer rule (7.4)
     ensure_open();
     if (key.empty()) {
         throw Error(ErrorCode::InvalidArgument, "empty key is not allowed");
@@ -199,18 +298,18 @@ std::optional<std::string> Engine::get(std::string_view key, GetTrace* trace) {
 
     // Grab the current Version once and read only through it (5.7). The
     // shared_ptr keeps everything in it alive even if a publish happens.
-    const std::shared_ptr<const Version> v = current_version_;
+    const std::shared_ptr<const Version> v = current_version_.load();
 
     // Global read order (4.3 C): active -> immutables (newest->oldest) ->
     // SSTables (newest->oldest). First hit wins; a tombstone means NOT FOUND
     // and stops the search.
-    if (const MemEntry* e = v->active->find(key)) {
+    if (const auto e = v->active->find(key)) {
         t.memtable_hit = true;
         return e->tombstone ? std::nullopt : std::optional<std::string>(e->value);
     }
     for (const auto& imm : v->immutables) {      // stored newest-first
         t.immutables_consulted += 1;
-        if (const MemEntry* e = imm->find(key)) {
+        if (const auto e = imm->find(key)) {
             return e->tombstone ? std::nullopt : std::optional<std::string>(e->value);
         }
     }
@@ -232,6 +331,7 @@ void Engine::apply_mutation(std::string_view key, std::string_view value,
 void Engine::maybe_rotate(bool replaying) {
     if (active_->bytes() < config_.memtable_max_bytes) return;
 
+    std::lock_guard st(state_mutex_);
     if (immutables_.size() >= config_.max_immutable_tables) {
         // Rotation deferred: the active table keeps growing; the next live
         // write is refused by ensure_write_capacity(). Replay cannot block,
@@ -258,45 +358,114 @@ void Engine::maybe_rotate(bool replaying) {
 
     // Publish the new table set; replay publishes once at the end of open().
     if (!replaying) {
+        std::cerr << "rotate: active->immutable size=" << immutables_.front()->bytes()
+                  << " immutables=" << immutables_.size() << '\n';
         publish_version("rotation");
+        state_cv_.notify_all();   // wake the FlushWorker
     }
 }
 
-std::vector<SstBuildResult> Engine::flush_pending() {
-    ensure_open();
-    std::vector<SstBuildResult> results;
+// Flush the oldest immutable memtable, if any. Serialized against
+// compaction by creation_mutex_; safe to call from the FlushWorker and the
+// CLI at the same time. Returns false when nothing was pending.
+bool Engine::flush_one() {
+    std::lock_guard creation(creation_mutex_);
     const fs::path sst_dir = config_.resolved_sst_dir();
+    const auto t0 = std::chrono::steady_clock::now();
 
-    while (!immutables_.empty()) {
-        const Memtable& oldest = *immutables_.back();   // newest-first list
+    std::shared_ptr<Memtable> target;
+    std::uint64_t out_id = 0;
+    {
+        std::lock_guard st(state_mutex_);
+        if (immutables_.empty()) return false;
+        target = immutables_.back();      // oldest; stays visible to readers
+        out_id = manifest_.next_id();
+    }
 
-        SstBuildResult r = write_sstable(sst_dir, manifest_.next_id(), oldest, config_);
+    bg_.flush_running = true;
+    std::cerr << "flush: start bytes=" << target->bytes() << '\n';
+    SstBuildResult r;
+    try {
+        r = write_sstable(sst_dir, out_id, *target, config_);
+    } catch (...) {
+        bg_.flush_running = false;
+        throw;
+    }
 
-        TableMeta meta;
-        meta.id = r.id;
-        meta.file_name = r.file_name;
-        meta.min_key = r.min_key;
-        meta.max_key = r.max_key;
-        meta.min_seqno = r.min_seqno;
-        meta.max_seqno = r.max_seqno;
-        meta.created_at = utc_now_iso8601();
-        meta.file_size = r.file_size;
-        meta.entries = r.entries;
-        meta.bloom_bits_per_key = r.bloom_bits_per_key;
-        meta.bloom_hashes = r.bloom_hashes;
+    TableMeta meta;
+    meta.id = r.id;
+    meta.file_name = r.file_name;
+    meta.min_key = r.min_key;
+    meta.max_key = r.max_key;
+    meta.min_seqno = r.min_seqno;
+    meta.max_seqno = r.max_seqno;
+    meta.created_at = utc_now_iso8601();
+    meta.file_size = r.file_size;
+    meta.entries = r.entries;
+    meta.bloom_bits_per_key = r.bloom_bits_per_key;
+    meta.bloom_hashes = r.bloom_hashes;
+
+    {
+        std::lock_guard st(state_mutex_);
         manifest_.add_table(meta);         // atomic manifest update (3.7); epoch += 1
         readers_.insert(readers_.begin(),  // newest first, matching the manifest
                         std::make_shared<TableReader>(sst_dir / r.file_name, meta, config_));
         immutables_.pop_back();            // reclaim RAM (3.4 step 10)
         publish_version("flush");          // readers see the swap atomically (5.5)
+    }
+    state_cv_.notify_all();                // free a stalled writer (7.6)
 
-        // Watermark cleanup: memtables are strictly seqNo-ordered, so every
-        // WAL record at or below the flushed max seqNo is covered by an
-        // SSTable (or superseded within one).
-        for (const auto& name : wal_->remove_segments_covered(manifest_.max_seqno())) {
-            std::cout << "wal: deleted " << name << " (covered by flushed SSTables)\n";
+    // Watermark WAL cleanup. The Wal is internally synchronized, so this
+    // never contends with a (possibly stalled) writer holding write_mutex_
+    // — taking write_mutex_ here would deadlock: the stalled writer waits
+    // for THIS worker to free an immutable slot.
+    std::uint64_t watermark;
+    {
+        std::lock_guard st(state_mutex_);
+        watermark = manifest_.max_seqno();
+    }
+    for (const auto& name : wal_->remove_segments_covered(watermark)) {
+        std::cout << "wal: deleted " << name << " (covered by flushed SSTables)\n";
+    }
+
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    bg_.flush_jobs_total += 1;
+    bg_.flush_last_ms = static_cast<std::uint64_t>(ms);
+    bg_.flush_running = false;
+    std::cerr << "flush: publish sst=" << r.file_name << " bytes=" << r.file_size
+              << " dur=" << ms << "ms\n";
+    return true;
+}
+
+std::vector<SstBuildResult> Engine::flush_pending() {
+    ensure_open();
+    std::vector<SstBuildResult> results;
+    while (true) {
+        std::uint64_t before;
+        {
+            std::lock_guard st(state_mutex_);
+            before = immutables_.size();
         }
-
+        if (before == 0) break;
+        if (!flush_one()) break;
+        // Report the table that just landed (front of manifest).
+        SstBuildResult r;
+        {
+            std::lock_guard st(state_mutex_);
+            const TableMeta& t = manifest_.tables().front();
+            r.id = t.id;
+            r.file_name = t.file_name;
+            r.file_size = t.file_size;
+            r.min_key = t.min_key;
+            r.max_key = t.max_key;
+            r.min_seqno = t.min_seqno;
+            r.max_seqno = t.max_seqno;
+            r.entries = t.entries;
+            r.bloom_bits_per_key = t.bloom_bits_per_key;
+            r.bloom_hashes = t.bloom_hashes;
+        }
         results.push_back(std::move(r));
     }
 
@@ -306,11 +475,14 @@ std::vector<SstBuildResult> Engine::flush_pending() {
 
 void Engine::maybe_auto_compact() {
     if (compaction_paused()) return;
+    auto table_count = [&] {
+        std::lock_guard st(state_mutex_);
+        return manifest_.tables().size();
+    };
     // Guard against a picker that can't shrink the set any further.
     std::size_t previous = SIZE_MAX;
-    while (manifest_.tables().size() >= config_.l0_compaction_trigger &&
-           manifest_.tables().size() < previous) {
-        previous = manifest_.tables().size();
+    while (table_count() >= config_.l0_compaction_trigger && table_count() < previous) {
+        previous = table_count();
         if (!run_compaction(std::nullopt)) break;
     }
 }
@@ -332,8 +504,21 @@ void Engine::set_compaction_paused(bool paused) {
 std::optional<CompactionJobResult>
 Engine::run_compaction(const std::optional<std::vector<std::uint64_t>>& inputs) {
     ensure_open();
+    // Serialized against flushes and other compactions (7.4 in-progress
+    // rule: a file can never be in two jobs).
+    std::lock_guard creation(creation_mutex_);
+    bg_.compact_running = true;
+    struct RunningGuard {
+        std::atomic<bool>& flag;
+        ~RunningGuard() { flag = false; }
+    } running_guard{bg_.compact_running};
+
     const fs::path sst_dir = config_.resolved_sst_dir();
-    const auto& live = manifest_.tables();   // newest first
+    std::vector<TableMeta> live;   // snapshot, newest first
+    {
+        std::lock_guard st(state_mutex_);
+        live = manifest_.tables();
+    }
 
     // Choose the input set.
     std::vector<std::uint64_t> ids;
@@ -427,6 +612,13 @@ Engine::run_compaction(const std::optional<std::vector<std::uint64_t>>& inputs) 
                      });
     }
 
+    // Cancel checkpoint (7.7 fast shutdown): nothing published yet, inputs
+    // stay live; the job is simply abandoned.
+    if (cancel_compaction_) {
+        std::cerr << "compact: job=" << job.job_id << " cancelled before output write\n";
+        return std::nullopt;
+    }
+
     Memtable final_table(config_.memtable_size_overhead_bytes_per_entry);
     for (const auto& [key, entry] : merged.sorted_entries()) {
         if (entry.tombstone) {
@@ -449,7 +641,12 @@ Engine::run_compaction(const std::optional<std::vector<std::uint64_t>>& inputs) 
     const TableMeta* added = nullptr;
     TableMeta out_meta;
     if (final_table.entries() > 0) {
-        SstBuildResult r = write_sstable(sst_dir, manifest_.next_id(), final_table, config_);
+        std::uint64_t out_id;
+        {
+            std::lock_guard st(state_mutex_);
+            out_id = manifest_.next_id();
+        }
+        SstBuildResult r = write_sstable(sst_dir, out_id, final_table, config_);
         out_meta.id = r.id;
         out_meta.file_name = r.file_name;
         out_meta.min_key = r.min_key;
@@ -465,27 +662,41 @@ Engine::run_compaction(const std::optional<std::vector<std::uint64_t>>& inputs) 
         job.bytes_out = r.file_size;
         job.output_file = r.file_name;
     }
-    manifest_.apply_compaction(ids, added);
+    // Final cancel checkpoint before anything becomes visible.
+    if (cancel_compaction_) {
+        if (added) {
+            std::error_code del_ec;
+            fs::remove(sst_dir / out_meta.file_name, del_ec);   // unpublished orphan
+        }
+        std::cerr << "compact: job=" << job.job_id << " cancelled before manifest edit\n";
+        return std::nullopt;
+    }
 
-    // Rebuild the reader list from the manifest, reusing untouched handles.
-    std::vector<std::shared_ptr<TableReader>> new_readers;
     std::vector<std::shared_ptr<TableReader>> removed;
-    for (const auto& t : manifest_.tables()) {
-        auto it = std::find_if(readers_.begin(), readers_.end(),
-                               [&](const auto& r) { return r->meta().id == t.id; });
-        if (it != readers_.end()) {
-            new_readers.push_back(*it);
-        } else {
-            new_readers.push_back(std::make_shared<TableReader>(sst_dir / t.file_name, t, config_));
+    {
+        std::lock_guard st(state_mutex_);
+        manifest_.apply_compaction(ids, added);
+
+        // Rebuild the reader list from the manifest, reusing untouched handles.
+        std::vector<std::shared_ptr<TableReader>> new_readers;
+        for (const auto& t : manifest_.tables()) {
+            auto it = std::find_if(readers_.begin(), readers_.end(),
+                                   [&](const auto& r) { return r->meta().id == t.id; });
+            if (it != readers_.end()) {
+                new_readers.push_back(*it);
+            } else {
+                new_readers.push_back(
+                    std::make_shared<TableReader>(sst_dir / t.file_name, t, config_));
+            }
         }
-    }
-    for (const auto& r : readers_) {
-        if (std::find(ids.begin(), ids.end(), r->meta().id) != ids.end()) {
-            removed.push_back(r);
+        for (const auto& r : readers_) {
+            if (std::find(ids.begin(), ids.end(), r->meta().id) != ids.end()) {
+                removed.push_back(r);
+            }
         }
+        readers_ = std::move(new_readers);
+        publish_version("compaction");
     }
-    readers_ = std::move(new_readers);
-    publish_version("compaction");
 
     // Delete inputs only when no Version references them any more (6.7).
     // Single-threaded today, so after the publish the refcount is ours alone.
@@ -526,17 +737,35 @@ Engine::run_compaction(const std::optional<std::vector<std::uint64_t>>& inputs) 
     state.last_job_finished_at = utc_now_iso8601();
     save_compaction_state(config_.data_dir, state);
 
+    bg_.compactions_total += 1;
+    bg_.compaction_last_ms = job.duration_ms;
     std::cout << format_job_line(job) << '\n';
     return job;
 }
 
-void Engine::close() {
+void Engine::close(bool graceful) {
     if (closed_) return;
-    if (wal_) {
-        wal_->close();
+    shutting_down_ = true;             // new writes now fail with StoreClosed
+    state_cv_.notify_all();            // release any stalled writer
+
+    if (workers_running_) {
+        if (graceful) {
+            // 7.7 graceful: drain every queued flush; let the running
+            // compaction finish (creation_mutex_ waits for it), no new jobs.
+            while (flush_one()) {}
+        } else {
+            // 7.7 fast: cancel compaction at its next checkpoint; leave
+            // queued immutables in RAM — the WAL still covers them.
+            cancel_compaction_ = true;
+        }
+        stop_workers();
     }
-    // Unflushed immutables may remain at close; the WAL still covers them
-    // (their segments are only deleted after a successful flush).
+    // With workers off (plain one-shot commands), queued immutables simply
+    // stay in RAM/WAL as in earlier sections — replay rebuilds them.
+
+    if (wal_) {
+        wal_->close();                 // finish appends, fsync, close segment
+    }
     closed_ = true;
 }
 
@@ -547,6 +776,7 @@ WalStats Engine::wal_stats() const {
 
 MemtableStats Engine::memtable_stats() const {
     ensure_open();
+    std::lock_guard st(state_mutex_);
     MemtableStats s;
     s.active_entries = active_->entries();
     s.active_bytes = active_->bytes();
@@ -559,6 +789,7 @@ MemtableStats Engine::memtable_stats() const {
 }
 
 SstStats Engine::sst_stats() const {
+    std::lock_guard st(state_mutex_);
     SstStats s;
     s.sst_count = manifest_.tables().size();
     s.sst_total_bytes = manifest_.total_bytes();

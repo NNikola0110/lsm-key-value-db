@@ -42,6 +42,8 @@ struct Config {
     std::uint32_t compaction_io_mb_per_s = 0;         // 0 = unthrottled
     std::uint32_t l0_compaction_trigger = 8;          // auto-compact when tables >= this
     std::uint32_t l0_stop_writes        = 20;         // write stall when tables > this
+    std::uint32_t bg_tick_ms            = 500;        // background worker wake-up period
+    std::uint32_t shutdown_timeout_ms   = 5000;       // fast-shutdown drain grace period
 
     // Resolution priority (later overrides earlier):
     //   built-in defaults -> config file -> env vars (LSMKV_*).

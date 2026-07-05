@@ -1,10 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -16,13 +18,14 @@
 
 namespace lsm {
 
-// Process-wide read-path counters (Section 4.7 stats).
+// Process-wide read-path counters (Section 4.7 stats). Atomic: many readers
+// bump these concurrently (Section 7).
 struct ReadStats {
-    std::uint64_t blooms_checked    = 0;
-    std::uint64_t blooms_negative   = 0;   // tables skipped thanks to the Bloom
-    std::uint64_t cache_hits        = 0;
-    std::uint64_t cache_misses      = 0;
-    std::uint64_t disk_block_reads  = 0;
+    std::atomic<std::uint64_t> blooms_checked{0};
+    std::atomic<std::uint64_t> blooms_negative{0};  // tables skipped thanks to the Bloom
+    std::atomic<std::uint64_t> cache_hits{0};
+    std::atomic<std::uint64_t> cache_misses{0};
+    std::atomic<std::uint64_t> disk_block_reads{0};
 };
 
 // Per-lookup trace, printed by the CLI at log_level=debug.
@@ -38,7 +41,7 @@ struct GetTrace {
 
 // LRU cache for verified data blocks, keyed by (table id, block offset).
 // Blocks are checksum-validated before insertion, so a cache hit never
-// re-reads or re-verifies (Section 4.4).
+// re-reads or re-verifies (Section 4.4). Thread-safe via one internal mutex.
 class BlockCache {
 public:
     using BlockPtr = std::shared_ptr<const std::vector<unsigned char>>;
@@ -49,6 +52,7 @@ public:
     void insert(std::uint64_t table_id, std::uint64_t offset, BlockPtr block);
 
 private:
+    std::mutex mutex_;
     struct Key {
         std::uint64_t table, offset;
         bool operator==(const Key&) const = default;
@@ -69,15 +73,18 @@ class TableReader;
 
 // Keeps the number of simultaneously open SSTable files within
 // max_open_files by closing the least-recently-used reader (Section 4.4).
+// Victims are collected under the pool mutex but closed after releasing it,
+// so the pool lock never nests inside a reader's own lock (no ABBA).
 class FdPool {
 public:
     explicit FdPool(std::uint32_t max_open) : max_open_(max_open == 0 ? 1 : max_open) {}
     void on_open(TableReader* r);    // registers r; may evict the LRU reader
     void touch(TableReader* r);
     void on_close(TableReader* r);
-    [[nodiscard]] std::size_t open_count() const noexcept { return lru_.size(); }
+    [[nodiscard]] std::size_t open_count() const;
 
 private:
+    mutable std::mutex mutex_;
     std::uint32_t max_open_;
     std::list<TableReader*> lru_;    // front = most recently used
 };
@@ -91,7 +98,9 @@ struct TableHit {
 
 // Read-side handle for one .sst file (Section 4.2 "TableHandle").
 // Lazily opens the file and pins the Bloom filter (and, if
-// cache_index_blocks, the parsed index) in memory. Not thread-safe.
+// cache_index_blocks, the parsed index) in memory. A per-reader mutex
+// serializes file I/O and lazy loads; concurrent gets on different tables
+// proceed in parallel (Section 7).
 class TableReader {
 public:
     TableReader(std::filesystem::path path, TableMeta meta, const Config& cfg);
@@ -111,7 +120,8 @@ public:
 
     [[nodiscard]] const TableMeta& meta() const noexcept { return meta_; }
     [[nodiscard]] bool file_open() const noexcept { return file_ != nullptr; }
-    void close_file();               // called by FdPool eviction
+    void close_file();               // blocking close (destructor, validate)
+    bool try_close_file();           // non-blocking; used by FdPool eviction
 
 private:
     struct IndexEntry {
@@ -131,7 +141,9 @@ private:
     TableMeta meta_;
     const Config& cfg_;
 
+    std::mutex io_mutex_;   // guards file_, lazy loads and all reads
     std::FILE* file_ = nullptr;
+    FdPool* pool_ = nullptr;   // set on first open; deregisters in destructor
     bool footer_loaded_ = false;
     std::uint64_t index_off_ = 0, index_size_ = 0;
     std::uint64_t filter_off_ = 0, filter_size_ = 0;

@@ -9,11 +9,15 @@
 #include "lsm/sstable.hpp"
 #include "lsm/wal.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -43,6 +47,10 @@ void print_usage(std::ostream& os) {
           "  compaction-stats           backlog, last job summary, paused state\n"
           "  compaction-pause           stop picker/auto compactions (flag file)\n"
           "  compaction-resume          allow compactions again\n"
+          "  repl                       interactive session with background workers\n"
+          "  stress --threads N --ops M [--read-pct P]   concurrent hammer test\n"
+          "  bg-status                  worker states, queues, job totals\n"
+          "  shutdown [--fast]          exercise graceful (default) or fast shutdown\n"
           "  wal-verify                 scan WAL segments, print a recovery report (read-only)\n"
           "  wal-truncate --segment S --offset N   truncate a WAL segment (careful!)\n"
           "\n"
@@ -269,6 +277,131 @@ int run_wal_truncate(const std::unordered_map<std::string, std::string>& flags,
     return 0;
 }
 
+void print_bg_status(lsm::Engine& engine, const lsm::Config& cfg) {
+    const lsm::BgStats& b = engine.bg_stats();
+    const lsm::MemtableStats m = engine.memtable_stats();
+    const auto pick = lsm::pick_compaction(engine.manifest().tables(), cfg);
+    std::cout << "workers: running=" << (engine.background_running() ? "yes" : "no (one-shot)")
+              << " flush_running=" << b.flush_running
+              << " compact_running=" << b.compact_running << '\n'
+              << "queues: immutables=" << m.immutables_count
+              << " immutable_bytes=" << m.immutables_bytes_total
+              << " compaction_backlog_bytes=" << (pick ? pick->total_bytes : 0) << '\n'
+              << "totals: flush_jobs=" << b.flush_jobs_total
+              << " flush_last_ms=" << b.flush_last_ms
+              << " compactions=" << b.compactions_total
+              << " compaction_last_ms=" << b.compaction_last_ms
+              << " versions_published=" << b.versions_published_total << '\n'
+              << "stalls: write_stalls=" << b.write_stalls_total
+              << " stall_time_ms=" << b.stall_time_ms_total << '\n'
+              << "compaction_paused=" << (engine.compaction_paused() ? "yes" : "no") << '\n';
+    const lsm::CompactionState state = lsm::load_compaction_state(cfg.data_dir);
+    if (state.last_job) {
+        std::cout << "last job (" << state.last_job_finished_at << "): "
+                  << lsm::format_job_line(*state.last_job) << '\n';
+    }
+}
+
+int run_repl(const lsm::Config& cfg) {
+    lsm::Engine engine(cfg);
+    open_engine(engine);
+    engine.start_background();
+    std::cout << "repl ready (put K V | get K | del K | stats | bg-status | flush | compact"
+                 " | pause | resume | quit [--fast])\n";
+
+    std::string line;
+    bool graceful = true;
+    while (std::getline(std::cin, line)) {
+        std::istringstream is(line);
+        std::string cmd, a, b;
+        is >> cmd >> a >> b;
+        try {
+            if (cmd.empty()) continue;
+            if (cmd == "quit" || cmd == "exit") {
+                graceful = (a != "--fast");
+                break;
+            }
+            if (cmd == "put")       std::cout << "ok seqno=" << engine.put(a, b) << '\n';
+            else if (cmd == "del")  std::cout << "ok seqno=" << engine.remove(a) << '\n';
+            else if (cmd == "get") {
+                const auto v = engine.get(a);
+                std::cout << (v ? *v : "NOT FOUND") << '\n';
+            } else if (cmd == "stats") {
+                const lsm::MemtableStats m = engine.memtable_stats();
+                const lsm::SstStats t = engine.sst_stats();
+                std::cout << "active_bytes=" << m.active_bytes
+                          << " immutables=" << m.immutables_count
+                          << " sst_count=" << t.sst_count
+                          << " version=" << engine.current_version()->id << '\n';
+            } else if (cmd == "bg-status") print_bg_status(engine, cfg);
+            else if (cmd == "flush")   { for (const auto& r : engine.flush_pending())
+                                             std::cout << "flushed " << r.file_name << '\n'; }
+            else if (cmd == "compact") { if (!engine.run_compaction(std::nullopt))
+                                             std::cout << "no compaction set available\n"; }
+            else if (cmd == "pause")   engine.set_compaction_paused(true);
+            else if (cmd == "resume")  engine.set_compaction_paused(false);
+            else std::cout << "unknown repl command: " << cmd << '\n';
+        } catch (const lsm::Error& e) {
+            std::cout << '[' << lsm::to_string(e.code()) << "] " << e.what() << '\n';
+        }
+    }
+    std::cout << (graceful ? "shutting down (graceful)...\n" : "shutting down (fast)...\n");
+    engine.close(graceful);
+    std::cout << "closed ✓\n";
+    return 0;
+}
+
+int run_stress(const std::unordered_map<std::string, std::string>& flags,
+               const lsm::Config& cfg) {
+    const std::uint64_t threads = flags.contains("threads") && !flags.at("threads").empty()
+                                      ? std::stoull(flags.at("threads")) : 4;
+    const std::uint64_t ops = flags.contains("ops") && !flags.at("ops").empty()
+                                  ? std::stoull(flags.at("ops")) : 2000;
+    const std::uint64_t read_pct = flags.contains("read-pct") && !flags.at("read-pct").empty()
+                                       ? std::stoull(flags.at("read-pct")) : 50;
+
+    lsm::Engine engine(cfg);
+    open_engine(engine);
+    engine.start_background();
+
+    std::atomic<std::uint64_t> writes{0}, reads{0}, hits{0}, errors{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> workers;
+    for (std::uint64_t t = 0; t < threads; ++t) {
+        workers.emplace_back([&, t] {
+            std::mt19937_64 rng(t * 7919 + 17);
+            for (std::uint64_t i = 0; i < ops; ++i) {
+                const std::uint64_t k = rng() % (threads * ops / 4 + 1);
+                const std::string key = "s" + std::to_string(k);
+                try {
+                    if (rng() % 100 < read_pct) {
+                        if (engine.get(key)) hits += 1;
+                        reads += 1;
+                    } else {
+                        engine.put(key, "stress-value-" + std::to_string(i));
+                        writes += 1;
+                    }
+                } catch (const lsm::Error&) {
+                    errors += 1;
+                }
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+
+    std::cout << "stress: threads=" << threads << " ops_per_thread=" << ops
+              << " writes=" << writes << " reads=" << reads << " read_hits=" << hits
+              << " errors=" << errors << " dur=" << ms << "ms"
+              << " ops_per_sec=" << (ms > 0 ? (writes + reads) * 1000 / ms : 0) << '\n';
+    print_bg_status(engine, cfg);
+    engine.close(true);
+    std::cout << "closed ✓ (graceful)\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -481,6 +614,32 @@ int main(int argc, char** argv) {
             std::cout << (cmd == "compaction-pause" ? "compaction paused\n"
                                                     : "compaction resumed\n");
             engine.close();
+            return 0;
+        }
+
+        if (cmd == "repl") {
+            return run_repl(cfg);
+        }
+
+        if (cmd == "stress") {
+            return run_stress(flags, cfg);
+        }
+
+        if (cmd == "bg-status") {
+            lsm::Engine engine(cfg);
+            open_engine(engine);
+            print_bg_status(engine, cfg);
+            engine.close();
+            return 0;
+        }
+
+        if (cmd == "shutdown") {
+            const bool fast = flags.contains("fast");
+            lsm::Engine engine(cfg);
+            open_engine(engine);
+            engine.start_background();
+            engine.close(!fast);
+            std::cout << "closed ✓ (" << (fast ? "fast" : "graceful") << ")\n";
             return 0;
         }
 

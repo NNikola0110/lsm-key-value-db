@@ -21,5 +21,7 @@
   "compaction_max_concurrent": 1,
   "compaction_io_mb_per_s": 0,
   "l0_compaction_trigger": 8,
-  "l0_stop_writes": 20
+  "l0_stop_writes": 20,
+  "bg_tick_ms": 500,
+  "shutdown_timeout_ms": 5000
 }

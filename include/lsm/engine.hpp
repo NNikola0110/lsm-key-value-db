@@ -1,9 +1,13 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "lsm/compaction.hpp"
@@ -53,6 +57,20 @@ struct SstStats {
     std::uint64_t newest_id       = 0;   // 0 = none
 };
 
+// Background-work counters (Section 7.9). Atomics: workers and the CLI
+// thread read/write them concurrently.
+struct BgStats {
+    std::atomic<bool>          flush_running{false};
+    std::atomic<bool>          compact_running{false};
+    std::atomic<std::uint64_t> flush_jobs_total{0};
+    std::atomic<std::uint64_t> flush_last_ms{0};
+    std::atomic<std::uint64_t> compactions_total{0};
+    std::atomic<std::uint64_t> compaction_last_ms{0};
+    std::atomic<std::uint64_t> write_stalls_total{0};
+    std::atomic<std::uint64_t> stall_time_ms_total{0};
+    std::atomic<std::uint64_t> versions_published_total{0};
+};
+
 // The storage engine facade. As of Section 3: Put/Delete append durably to
 // the WAL, then update the active memtable; a live rotation also rolls the
 // WAL segment so cleanup boundaries stay tight. flush_pending writes
@@ -68,6 +86,17 @@ struct SstStats {
 // As of Section 5, every change to the table set (rotation, flush) builds a
 // fresh immutable Version and publishes it with a pointer swap; Get grabs
 // the current Version once and only reads objects inside it (5.7).
+//
+// Section 7 thread model: writes are serialized by write_mutex_ (WAL append
+// + memtable update + rotation); readers are lock-free at the top (atomic
+// Version load) with fine-grained locks below (memtable shared_mutex,
+// per-table io mutex, cache mutex). Optional background workers — a
+// FlushWorker and a CompactionWorker — start with start_background();
+// one-shot CLI commands leave them off and stay fully deterministic.
+// Table-set changes (manifest edit + reader list + publish) happen under
+// state_mutex_; SSTable creation (flush/compaction) is serialized by
+// creation_mutex_ ("flush beats compaction" is enforced by the compaction
+// worker yielding whenever immutables are queued).
 class Engine {
 public:
     explicit Engine(Config config);
@@ -81,7 +110,15 @@ public:
     // nullopt = NOT FOUND. Fills *trace (if given) for debug logging.
     std::optional<std::string> get(std::string_view key, GetTrace* trace = nullptr);
     std::uint64_t remove(std::string_view key);                       // Delete; returns seqNo
-    void close();
+
+    // Start the FlushWorker and CompactionWorker loops (Section 7.2).
+    void start_background();
+    [[nodiscard]] bool background_running() const noexcept { return workers_running_; }
+
+    // Shutdown (7.7). graceful: drain all flushes, let a running compaction
+    // finish. fast: skip queued flushes (WAL covers them), cancel the
+    // running compaction at its next checkpoint (inputs stay live).
+    void close(bool graceful = true);
 
     // Flush all pending immutables, oldest first (Section 3.4). Returns one
     // result per table written; empty when nothing was pending. May kick
@@ -106,32 +143,52 @@ public:
     [[nodiscard]] const ReadStats& read_stats() const noexcept { return read_stats_; }
     [[nodiscard]] std::size_t sstables_open() const noexcept { return fd_pool_->open_count(); }
     [[nodiscard]] std::shared_ptr<const Version> current_version() const noexcept {
-        return current_version_;
+        return current_version_.load();
     }
+    [[nodiscard]] const BgStats& bg_stats() const noexcept { return bg_; }
 
 private:
     void ensure_open() const;
-    void ensure_write_capacity();          // throws Backpressure when full (2.6)
+    void ensure_write_capacity();          // blocks (workers on) or throws (2.6/7.6)
     void apply_mutation(std::string_view key, std::string_view value,
                         std::uint64_t seqno, bool tombstone, bool replaying);
     void maybe_rotate(bool replaying);
-    void publish_version(const char* reason);   // build + atomic swap (5.5)
+    void publish_version(const char* reason);   // caller holds state_mutex_ (5.5)
     void maybe_auto_compact();                  // l0_compaction_trigger (6.8)
+    bool flush_one();                           // flush oldest immutable; false if none
+    void flush_worker_loop();
+    void compaction_worker_loop();
+    void stop_workers();
 
     Config config_;
+
+    // Long-lived infrastructure first: destroyed LAST, after every reader
+    // and Version that references it.
+    std::unique_ptr<BlockCache> block_cache_;
+    std::unique_ptr<FdPool> fd_pool_;
+    ReadStats read_stats_;
+    BgStats bg_;
+
     std::unique_ptr<Wal> wal_;
     std::shared_ptr<Memtable> active_;
     std::vector<std::shared_ptr<Memtable>> immutables_;   // newest first
     Manifest manifest_;
     std::vector<std::shared_ptr<TableReader>> readers_;   // newest first (manifest order)
-    std::shared_ptr<const Version> current_version_;
+    std::atomic<std::shared_ptr<const Version>> current_version_;
     std::uint64_t version_id_ = 0;
-    std::unique_ptr<BlockCache> block_cache_;
-    std::unique_ptr<FdPool> fd_pool_;
-    ReadStats read_stats_;
     std::uint64_t flush_requested_ = 0;
     bool backpressure_warned_ = false;
-    bool closed_ = false;
+
+    std::mutex write_mutex_;       // serializes put/del (7.4)
+    mutable std::mutex state_mutex_;   // immutables_/readers_/manifest_/publish
+    std::mutex creation_mutex_;    // serializes SSTable creation (flush vs compaction)
+    std::condition_variable state_cv_;   // signaled when a flush frees a slot
+    std::atomic<bool> workers_running_{false};
+    std::atomic<bool> stop_workers_{false};
+    std::atomic<bool> shutting_down_{false};
+    std::atomic<bool> cancel_compaction_{false};
+    std::thread flush_thread_, compact_thread_;
+    std::atomic<bool> closed_{false};
 };
 
 } // namespace lsm

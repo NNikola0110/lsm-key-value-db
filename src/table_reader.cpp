@@ -68,6 +68,7 @@ std::uint64_t fnv1a(std::string_view s, std::uint64_t seed) {
 // --- BlockCache -------------------------------------------------------
 
 BlockCache::BlockPtr BlockCache::find(std::uint64_t table_id, std::uint64_t offset) {
+    std::lock_guard lock(mutex_);
     const Key key{table_id, offset};
     auto it = map_.find(key);
     if (it == map_.end()) return nullptr;
@@ -76,6 +77,7 @@ BlockCache::BlockPtr BlockCache::find(std::uint64_t table_id, std::uint64_t offs
 }
 
 void BlockCache::insert(std::uint64_t table_id, std::uint64_t offset, BlockPtr block) {
+    std::lock_guard lock(mutex_);
     const Key key{table_id, offset};
     if (map_.contains(key)) return;
     used_ += block->size();
@@ -91,21 +93,41 @@ void BlockCache::insert(std::uint64_t table_id, std::uint64_t offset, BlockPtr b
 // --- FdPool -----------------------------------------------------------
 
 void FdPool::on_open(TableReader* r) {
-    lru_.push_front(r);
-    while (lru_.size() > max_open_) {
-        TableReader* victim = lru_.back();
-        lru_.pop_back();
-        victim->close_file();
+    std::vector<TableReader*> victims;
+    {
+        std::lock_guard lock(mutex_);
+        lru_.push_front(r);
+        while (lru_.size() > max_open_) {
+            victims.push_back(lru_.back());
+            lru_.pop_back();
+        }
+    }
+    // Close victims outside the pool lock, and only with try_lock: the
+    // caller holds its own reader's io_mutex_, and a blocking close of a
+    // busy victim (whose thread may itself be evicting) could deadlock.
+    // A busy victim just stays open — the budget is soft for one round.
+    for (TableReader* victim : victims) {
+        if (!victim->try_close_file()) {
+            std::lock_guard lock(mutex_);
+            lru_.push_back(victim);   // still open; keep tracking it
+        }
     }
 }
 
 void FdPool::touch(TableReader* r) {
+    std::lock_guard lock(mutex_);
     auto it = std::find(lru_.begin(), lru_.end(), r);
     if (it != lru_.end()) lru_.splice(lru_.begin(), lru_, it);
 }
 
 void FdPool::on_close(TableReader* r) {
+    std::lock_guard lock(mutex_);
     lru_.remove(r);
+}
+
+std::size_t FdPool::open_count() const {
+    std::lock_guard lock(mutex_);
+    return lru_.size();
 }
 
 // --- TableReader ------------------------------------------------------
@@ -114,17 +136,30 @@ TableReader::TableReader(fs::path path, TableMeta meta, const Config& cfg)
     : path_(std::move(path)), meta_(std::move(meta)), cfg_(cfg) {}
 
 TableReader::~TableReader() {
+    if (pool_) pool_->on_close(this);   // drop any stale LRU entry
     if (file_) std::fclose(file_);
 }
 
 void TableReader::close_file() {
+    std::lock_guard lock(io_mutex_);
     if (file_) {
         std::fclose(file_);
         file_ = nullptr;
     }
 }
 
+bool TableReader::try_close_file() {
+    std::unique_lock lock(io_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    if (file_) {
+        std::fclose(file_);
+        file_ = nullptr;
+    }
+    return true;
+}
+
 void TableReader::ensure_open(FdPool& fds) {
+    pool_ = &fds;
     if (file_) {
         fds.touch(this);
         return;
@@ -247,6 +282,11 @@ std::optional<TableHit> TableReader::get(std::string_view key, BlockCache& cache
         trace.range_skipped += 1;
         return std::nullopt;
     }
+
+    // Serialize file I/O and lazy loads on this table (per-reader lock;
+    // lookups on other tables run in parallel). Note close_file() also
+    // takes this lock, so FdPool eviction cannot yank the file mid-read.
+    std::lock_guard io_lock(io_mutex_);
 
     ensure_open(fds);
 

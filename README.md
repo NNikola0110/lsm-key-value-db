@@ -3,12 +3,13 @@
 A single-node LSM (Log-Structured Merge) key-value store — Phase A.
 Language: **C++23**. Build: **CMake**.
 
-Progress: **Section 6 (size-tiered compaction)** is implemented. The engine
-now merges small SSTables into larger ones (newest seqNo wins, tombstones
-respect a grace period), publishes the result through one atomic manifest
-edit + Version swap, deletes input files once unreferenced, auto-kicks when
-`l0_compaction_trigger` is exceeded, and can stall writes at `l0_stop_writes`.
-Next up: concurrency & scheduling (7).
+Progress: **Section 7 (concurrency & scheduling)** is implemented. The engine
+is now multi-threaded: a mutex-serialized writer, lock-free readers (atomic
+Version snapshots), a background **FlushWorker** and **CompactionWorker**,
+blocking write backpressure, and graceful/fast shutdown. Long-running modes:
+`lsmkv repl` (interactive) and `lsmkv stress` (concurrent hammer test).
+One-shot commands keep workers off and stay deterministic.
+Next up: observability & tooling (8).
 
 ## Build
 
@@ -40,6 +41,11 @@ build/lsmkv compaction-run --files 3,2,1      # compact an explicit adjacent set
 build/lsmkv compaction-stats                  # backlog, next pick, last job summary
 build/lsmkv compaction-pause                  # flag file blocks picker + auto runs
 build/lsmkv compaction-resume
+build/lsmkv repl                              # interactive session, workers running
+build/lsmkv stress --threads 4 --ops 3000 --read-pct 40   # concurrent load test
+build/lsmkv bg-status                         # worker states, queues, job totals
+build/lsmkv shutdown            # graceful: drain flushes, finish compaction
+build/lsmkv shutdown --fast     # cancel compaction, leave immutables to the WAL
 build/lsmkv stats                      # config + WAL stats + memtable stats
 build/lsmkv close                      # finish appends, sync, exit cleanly
 build/lsmkv flush-now                  # flush pending immutables to data/sst/
@@ -148,6 +154,39 @@ Missing `--key` exits with a non-zero code.
 - Set `publish_log_level=debug` (or `LSMKV_PUBLISH_LOG_LEVEL=debug`) to log
   a one-liner for every publish.
 
+## Concurrency & scheduling (Section 7)
+
+- **Thread model (7.2/7.4):** writes (`put`/`del`) are serialized by a single
+  write mutex — WAL append, memtable update, rotation. Readers never take
+  the write lock: `get` atomically loads the current Version and reads only
+  inside it (memtables use a shared_mutex; each SSTable reader serializes
+  its own file I/O; the block cache and FD pool have internal locks).
+- **Workers:** the FlushWorker drains the immutable queue (woken instantly
+  on rotation, else every `bg_tick_ms`); the CompactionWorker ticks every
+  `bg_tick_ms` and yields whenever flush work is queued ("flush beats
+  compaction"). A periodic tick only acts on size-similar picks; the
+  fallback pick requires the `l0_compaction_trigger`. SSTable creation is
+  serialized by one lock, so a file can never be in two jobs.
+- **Backpressure (7.6):** with workers running, a full immutable queue
+  *blocks* the writer (`stall: immutables=N (max=M) blocking writes`) until
+  a flush frees a slot; stall counts/time appear in `bg-status`. Without
+  workers (one-shot commands) it throws `Backpressure` as before. The
+  `l0_stop_writes` stall still rejects with an error in both modes.
+- **Shutdown (7.7):** `graceful` drains every queued flush and lets a
+  running compaction finish; `fast` cancels compaction at its next
+  checkpoint (inputs stay live, unpublished output deleted) and leaves
+  queued immutables in RAM — the WAL covers them and replay rebuilds them.
+- **Failure policy (7.8):** a failed flush keeps its immutable queued and
+  retries next tick; a failed compaction abandons the job with inputs live.
+- **Lock-ordering rule** (learned the hard way — the first version
+  deadlocked): the WAL is internally synchronized and background workers
+  never take the write mutex; a stalled writer *holds* the write mutex
+  while waiting for the FlushWorker, so any worker that needed it would
+  deadlock the engine. FD-pool eviction closes victims with try-lock only,
+  for the same reason.
+- One-shot CLI commands leave workers **off** — deterministic, exactly the
+  Section 2–6 behavior. `repl`, `stress`, and `shutdown` run them.
+
 ## Compaction (Section 6)
 
 - **Picker (deterministic):** tables are considered newest→oldest (manifest
@@ -224,7 +263,9 @@ Keys: `data_dir`, `memtable_max_bytes`, `max_immutable_tables`,
 spread in a picked set), `tombstone_grace_seconds` (86400),
 `compaction_max_concurrent` (1; the CLI runs jobs synchronously),
 `compaction_io_mb_per_s` (0 = unthrottled), `l0_compaction_trigger` (8,
-auto-compact threshold), `l0_stop_writes` (20, write-stall threshold).
+auto-compact threshold), `l0_stop_writes` (20, write-stall threshold),
+`bg_tick_ms` (500, worker wake-up period), `shutdown_timeout_ms` (5000,
+fast-shutdown grace period).
 
 Resolution priority (later wins): built-in defaults → config file →
 env vars (`LSMKV_*`) → CLI flags (currently `--log-level`). A missing config
