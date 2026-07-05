@@ -35,6 +35,13 @@ struct Config {
     LogLevel      log_level             = LogLevel::Info;
     std::string   manifest_path         = "";         // empty = <data_dir>/manifest.json
     LogLevel      publish_log_level     = LogLevel::Info;  // debug => log every publish
+    std::uint32_t size_tiered_fan_in    = 4;          // tables merged per compaction (6.3)
+    double        size_tiered_size_ratio = 2.0;       // max size spread within a picked set
+    std::uint32_t tombstone_grace_seconds = 86400;    // keep tombstones younger than this
+    std::uint32_t compaction_max_concurrent = 1;      // jobs at once (CLI runs 1 anyway)
+    std::uint32_t compaction_io_mb_per_s = 0;         // 0 = unthrottled
+    std::uint32_t l0_compaction_trigger = 8;          // auto-compact when tables >= this
+    std::uint32_t l0_stop_writes        = 20;         // write stall when tables > this
 
     // Resolution priority (later overrides earlier):
     //   built-in defaults -> config file -> env vars (LSMKV_*).

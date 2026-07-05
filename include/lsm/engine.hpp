@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "lsm/compaction.hpp"
 #include "lsm/config.hpp"
 #include "lsm/manifest.hpp"
 #include "lsm/memtable.hpp"
@@ -83,8 +84,18 @@ public:
     void close();
 
     // Flush all pending immutables, oldest first (Section 3.4). Returns one
-    // result per table written; empty when nothing was pending.
+    // result per table written; empty when nothing was pending. May kick
+    // compaction afterwards if l0_compaction_trigger is exceeded (6.8).
     std::vector<SstBuildResult> flush_pending();
+
+    // Run one compaction job (Section 6). inputs: explicit table ids
+    // (--files) or nullopt to consult the picker. Returns nullopt when no
+    // set is available. Throws InvalidArgument for bad manual sets.
+    std::optional<CompactionJobResult>
+    run_compaction(const std::optional<std::vector<std::uint64_t>>& inputs);
+
+    [[nodiscard]] bool compaction_paused() const;
+    void set_compaction_paused(bool paused);   // flag file, survives restarts
 
     [[nodiscard]] const Config& config() const noexcept { return config_; }
     [[nodiscard]] bool closed() const noexcept { return closed_; }
@@ -105,6 +116,7 @@ private:
                         std::uint64_t seqno, bool tombstone, bool replaying);
     void maybe_rotate(bool replaying);
     void publish_version(const char* reason);   // build + atomic swap (5.5)
+    void maybe_auto_compact();                  // l0_compaction_trigger (6.8)
 
     Config config_;
     std::unique_ptr<Wal> wal_;

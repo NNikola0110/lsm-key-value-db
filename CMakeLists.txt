@@ -21,6 +21,7 @@ FetchContent_MakeAvailable(nlohmann_json)
 # --- The lsmkv CLI executable ---
 add_executable(lsmkv
   src/main.cpp
+  src/compaction.cpp
   src/config.cpp
   src/engine.cpp
   src/manifest.cpp

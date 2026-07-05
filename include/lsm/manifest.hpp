@@ -44,6 +44,12 @@ public:
     // epoch and atomically rewrite the file.
     void add_table(const TableMeta& meta);
 
+    // Compaction edit (6.7): remove the input tables and add the output (if
+    // any) in ONE atomic manifest rewrite. Order stays newest-first by
+    // max_seqno. Bumps the epoch once.
+    void apply_compaction(const std::vector<std::uint64_t>& removed_ids,
+                          const TableMeta* added);
+
     // Newest -> oldest.
     [[nodiscard]] const std::vector<TableMeta>& tables() const noexcept { return tables_; }
     [[nodiscard]] std::uint64_t epoch() const noexcept { return epoch_; }

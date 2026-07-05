@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 
 #include "lsm/config.hpp"
@@ -66,5 +67,11 @@ struct SstInfo {
 
 // Throws CorruptionDetected on bad magic/checksums.
 SstInfo inspect_sstable(const std::filesystem::path& file);
+
+// Stream every entry of a table in key order (used by compaction, Section 6).
+// Verifies block checksums as it goes; throws CorruptionDetected on failure.
+using SstEntryFn = std::function<void(std::string_view key, std::string_view value,
+                                      std::uint64_t seqno, bool tombstone)>;
+void scan_sstable(const std::filesystem::path& file, const SstEntryFn& fn);
 
 } // namespace lsm

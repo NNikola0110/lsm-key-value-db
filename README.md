@@ -3,12 +3,12 @@
 A single-node LSM (Log-Structured Merge) key-value store — Phase A.
 Language: **C++23**. Build: **CMake**.
 
-Progress: **Section 5 (Manifest & Versioning)** is implemented. On top of the
-full read/write path (WAL → memtable → SSTables with Bloom/index/cache reads),
-every change to the table set now goes through an atomic **Version publish**:
-the manifest carries a monotonic `epoch`, readers grab an immutable `Version`
-snapshot per lookup, and rotation/flush swap in a fresh Version with a single
-pointer assignment. Next up: compaction (6).
+Progress: **Section 6 (size-tiered compaction)** is implemented. The engine
+now merges small SSTables into larger ones (newest seqNo wins, tombstones
+respect a grace period), publishes the result through one atomic manifest
+edit + Version swap, deletes input files once unreferenced, auto-kicks when
+`l0_compaction_trigger` is exceeded, and can stall writes at `l0_stop_writes`.
+Next up: concurrency & scheduling (7).
 
 ## Build
 
@@ -35,6 +35,11 @@ build/lsmkv probe --absent 1000               # absent keys: shows bloom skips
 build/lsmkv sst-info --file 000001.sst        # footer, index, blocks, bloom details
 build/lsmkv manifest-info                     # epoch + live table listing (newest first)
 build/lsmkv version-info                      # current Version: id/epoch, immutables, SSTs
+build/lsmkv compaction-run                    # run one job (picker chooses inputs)
+build/lsmkv compaction-run --files 3,2,1      # compact an explicit adjacent set
+build/lsmkv compaction-stats                  # backlog, next pick, last job summary
+build/lsmkv compaction-pause                  # flag file blocks picker + auto runs
+build/lsmkv compaction-resume
 build/lsmkv stats                      # config + WAL stats + memtable stats
 build/lsmkv close                      # finish appends, sync, exit cleanly
 build/lsmkv flush-now                  # flush pending immutables to data/sst/
@@ -143,6 +148,39 @@ Missing `--key` exits with a non-zero code.
 - Set `publish_log_level=debug` (or `LSMKV_PUBLISH_LOG_LEVEL=debug`) to log
   a one-liner for every publish.
 
+## Compaction (Section 6)
+
+- **Picker (deterministic):** tables are considered newest→oldest (manifest
+  order) and only **adjacent windows** of `size_tiered_fan_in` tables are
+  candidates. A window qualifies when its largest file is within
+  `size_tiered_size_ratio` (2.0) of its smallest; the qualifying window with
+  the fewest bytes wins, else the smallest window is picked as a fallback.
+  *Why adjacency (a deliberate deviation from the spec's pure size-sort):*
+  merging non-adjacent tables would give the output a seqNo range that
+  interleaves with untouched tables, breaking the read path's
+  first-hit-wins rule. Adjacent merges keep all live seqNo ranges disjoint,
+  so ordering tables by `max_seqno` stays correct forever. (The manifest is
+  therefore sorted by `max_seqno`, not id — after compaction, ids no longer
+  track data age.) `compaction-run --files` enforces the same adjacency.
+- **Merge:** inputs are streamed oldest→newest into a scratch memtable, so
+  the highest seqNo per key wins; only the latest version survives. The
+  output is written with the exact Section 3 safety dance (tmp → fsync →
+  rename → one atomic manifest edit) and published as a new Version.
+- **Tombstones:** dropped only if (a) the source table is older than
+  `tombstone_grace_seconds` (24 h default; table `created_at` is the age
+  proxy since entries carry no timestamps) and (b) every live table outside
+  the input set is entirely newer — so nothing older can be resurrected.
+- **File deletion:** inputs are deleted when no Version references them
+  (refcount rule); anything missed becomes an orphan that startup deletes
+  (a `.sst` not in the manifest — also exactly what a crash between rename
+  and manifest edit leaves behind).
+- **Steering:** flushes auto-kick compaction while live tables ≥
+  `l0_compaction_trigger`; writes stall with a loud warning above
+  `l0_stop_writes`; `compaction_io_mb_per_s` (0 = off) enforces a coarse
+  minimum job duration; pause/resume is a flag file
+  (`data/compaction.paused`) so it survives restarts. Job stats persist in
+  `data/compaction_stats.json` for `compaction-stats`.
+
 ## Read path (Section 4)
 
 - **Lookup order:** active memtable → immutables (newest→oldest) → SSTables
@@ -181,7 +219,12 @@ Keys: `data_dir`, `memtable_max_bytes`, `max_immutable_tables`,
 `max_build_buffer_mb`, `block_cache_mb`, `cache_index_blocks`,
 `max_open_files`, `wal_fsync_every_n`, `wal_segment_roll_bytes`,
 `compression` (`off|snappy|lz4`), `log_level` (`debug|info|warn|error`),
-`manifest_path` (empty = `<data_dir>/manifest.json`), `publish_log_level`.
+`manifest_path` (empty = `<data_dir>/manifest.json`), `publish_log_level`,
+`size_tiered_fan_in` (4 tables per merge), `size_tiered_size_ratio` (2.0 max
+spread in a picked set), `tombstone_grace_seconds` (86400),
+`compaction_max_concurrent` (1; the CLI runs jobs synchronously),
+`compaction_io_mb_per_s` (0 = unthrottled), `l0_compaction_trigger` (8,
+auto-compact threshold), `l0_stop_writes` (20, write-stall threshold).
 
 Resolution priority (later wins): built-in defaults → config file →
 env vars (`LSMKV_*`) → CLI flags (currently `--log-level`). A missing config

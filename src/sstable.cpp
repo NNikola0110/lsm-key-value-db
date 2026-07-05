@@ -341,6 +341,71 @@ SstInfo inspect_sstable(const fs::path& file) {
     return info;
 }
 
+void scan_sstable(const fs::path& file, const SstEntryFn& fn) {
+    constexpr std::size_t kEntryHeader = 4 + 4 + 8 + 1;
+    const SstInfo info = inspect_sstable(file);   // validates footer + index/filter crc
+
+    std::FILE* f = std::fopen(file.string().c_str(), "rb");
+    if (!f) {
+        throw Error(ErrorCode::IOFailure, "cannot open SSTable: " + file.string());
+    }
+    auto fail = [&](std::uint64_t off, const std::string& what) -> void {
+        std::fclose(f);
+        throw Error(ErrorCode::CorruptionDetected,
+                    file.filename().string() + " @" + std::to_string(off) + ": " + what);
+    };
+
+    // Re-walk the (already validated) index to visit data blocks in order.
+    std::vector<unsigned char> index_block(info.index_size);
+    std::fseek(f, static_cast<long>(info.index_off), SEEK_SET);
+    if (std::fread(index_block.data(), 1, index_block.size(), f) != index_block.size()) {
+        fail(info.index_off, "short read on index");
+    }
+
+    std::size_t pos = 0;
+    const std::size_t end = info.index_size - 4;
+    std::vector<unsigned char> block;
+    while (pos < end) {
+        const std::uint32_t key_len = get_u32(index_block.data() + pos);
+        pos += 4 + key_len;
+        const std::uint64_t block_off = get_u64(index_block.data() + pos);
+        pos += 8;
+        const std::uint32_t block_size = get_u32(index_block.data() + pos);
+        pos += 4;
+
+        block.resize(block_size);
+        if (std::fseek(f, static_cast<long>(block_off), SEEK_SET) != 0 ||
+            std::fread(block.data(), 1, block_size, f) != block_size) {
+            fail(block_off, "short read on data block");
+        }
+        if (block_size < 12 ||
+            crc32(block.data(), block_size - 4) != get_u32(block.data() + block_size - 4)) {
+            fail(block_off, "data block checksum mismatch");
+        }
+
+        const std::uint32_t restart_count = get_u32(block.data() + block_size - 8);
+        if (8ull + 4ull * restart_count > block_size) fail(block_off, "restart trailer invalid");
+        const std::size_t entries_end = block_size - 8 - 4ull * restart_count;
+
+        std::size_t p = 0;
+        while (p < entries_end) {
+            if (p + kEntryHeader > entries_end) fail(block_off + p, "truncated entry");
+            const std::uint32_t klen = get_u32(block.data() + p);
+            const std::uint32_t vlen = get_u32(block.data() + p + 4);
+            const std::uint64_t seqno = get_u64(block.data() + p + 8);
+            const std::uint8_t flags = block[p + 16];
+            if (p + kEntryHeader + klen + vlen > entries_end) {
+                fail(block_off + p, "entry overruns block");
+            }
+            fn(std::string_view(reinterpret_cast<const char*>(block.data() + p + kEntryHeader), klen),
+               std::string_view(reinterpret_cast<const char*>(block.data() + p + kEntryHeader + klen), vlen),
+               seqno, (flags & kFlagTombstone) != 0);
+            p += kEntryHeader + klen + vlen;
+        }
+    }
+    std::fclose(f);
+}
+
 std::string verify_sstable(const fs::path& file) {
     std::FILE* f = std::fopen(file.string().c_str(), "rb");
     if (!f) return "cannot open file";

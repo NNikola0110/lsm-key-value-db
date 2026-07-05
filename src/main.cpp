@@ -2,6 +2,7 @@
 // Section 0: skeleton. Section 1: put/del append to the WAL for real;
 // every command that opens the engine prints the recovery report first.
 
+#include "lsm/compaction.hpp"
 #include "lsm/config.hpp"
 #include "lsm/engine.hpp"
 #include "lsm/errors.hpp"
@@ -10,6 +11,7 @@
 
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -37,6 +39,10 @@ void print_usage(std::ostream& os) {
           "  flush-now                  flush pending immutable memtables to SSTables\n"
           "  list-sst                   list live SSTables from the manifest\n"
           "  verify-sst --file F        check footer magic and all block checksums\n"
+          "  compaction-run [--files 1,3,4]   run one compaction job (picker or manual)\n"
+          "  compaction-stats           backlog, last job summary, paused state\n"
+          "  compaction-pause           stop picker/auto compactions (flag file)\n"
+          "  compaction-resume          allow compactions again\n"
           "  wal-verify                 scan WAL segments, print a recovery report (read-only)\n"
           "  wal-truncate --segment S --offset N   truncate a WAL segment (careful!)\n"
           "\n"
@@ -412,6 +418,69 @@ int main(int argc, char** argv) {
                               ? static_cast<double>(info.bloom_bits) / info.bloom_keys
                               : 0.0)
                       << '\n';
+            return 0;
+        }
+
+        if (cmd == "compaction-run") {
+            lsm::Engine engine(cfg);
+            open_engine(engine);
+            if (engine.compaction_paused()) {
+                std::cout << "compaction is paused (data/compaction.paused); "
+                             "run compaction-resume first\n";
+                engine.close();
+                return 1;
+            }
+            std::optional<std::vector<std::uint64_t>> ids;
+            if (auto it = flags.find("files"); it != flags.end() && !it->second.empty()) {
+                ids.emplace();
+                std::stringstream ss(it->second);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) {
+                    // Accept "000101", "101" or "000101.sst".
+                    if (tok.size() > 4 && tok.ends_with(".sst")) tok.resize(tok.size() - 4);
+                    ids->push_back(std::stoull(tok));
+                }
+            }
+            if (!engine.run_compaction(ids)) {
+                std::cout << "no compaction set available (need >= "
+                          << cfg.size_tiered_fan_in << " tables)\n";
+            }
+            engine.close();
+            return 0;
+        }
+
+        if (cmd == "compaction-stats") {
+            lsm::Engine engine(cfg);
+            open_engine(engine);
+            const lsm::CompactionState state = lsm::load_compaction_state(cfg.data_dir);
+            const auto pick = lsm::pick_compaction(engine.manifest().tables(), cfg);
+            std::cout << "compaction: paused=" << (engine.compaction_paused() ? "yes" : "no")
+                      << " running=0 tables=" << engine.manifest().tables().size()
+                      << " backlog_bytes=" << (pick ? pick->total_bytes : 0) << '\n';
+            if (pick) {
+                std::cout << "next pick: [";
+                for (std::size_t i = 0; i < pick->ids.size(); ++i) {
+                    std::cout << (i ? "," : "") << pick->ids[i];
+                }
+                std::cout << "] reason=" << pick->reason << '\n';
+            }
+            if (state.last_job) {
+                std::cout << "last job (" << state.last_job_finished_at << "): "
+                          << lsm::format_job_line(*state.last_job) << '\n';
+            } else {
+                std::cout << "last job: none\n";
+            }
+            engine.close();
+            return 0;
+        }
+
+        if (cmd == "compaction-pause" || cmd == "compaction-resume") {
+            lsm::Engine engine(cfg);
+            open_engine(engine);
+            engine.set_compaction_paused(cmd == "compaction-pause");
+            std::cout << (cmd == "compaction-pause" ? "compaction paused\n"
+                                                    : "compaction resumed\n");
+            engine.close();
             return 0;
         }
 
