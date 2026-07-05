@@ -1,6 +1,8 @@
 {
   "data_dir": "./data",
   "memtable_max_bytes": 67108864,
+  "max_immutable_tables": 4,
+  "memtable_size_overhead_bytes_per_entry": 32,
   "block_size": 8192,
   "bloom_false_positive": 0.01,
   "wal_fsync_every_n": 1,

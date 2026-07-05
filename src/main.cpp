@@ -23,9 +23,9 @@ void print_usage(std::ostream& os) {
           "\n"
           "commands:\n"
           "  init                       prepare data/ and data/wal/, print resolved config\n"
-          "  put   --key K --value V    append a PUT record to the WAL\n"
-          "  get   --key K              read a value (not implemented until Section 2)\n"
-          "  del   --key K              append a DEL record to the WAL\n"
+          "  put   --key K --value V    WAL append + memtable update\n"
+          "  get   --key K              read from memtables, prints value or NOT FOUND\n"
+          "  del   --key K              WAL append + memtable tombstone\n"
           "  stats                      print config, WAL stats and engine status\n"
           "  close                      finish appends, sync, exit cleanly\n"
           "  wal-verify                 scan WAL segments, print a recovery report (read-only)\n"
@@ -75,11 +75,14 @@ std::string require_flag(const std::unordered_map<std::string, std::string>& fla
     return it->second;
 }
 
-// Open the engine (replays the WAL) and print the recovery report (1.8).
-lsm::WalRecoveryReport open_engine(lsm::Engine& engine) {
-    const lsm::WalRecoveryReport report = engine.open();
-    report.print(std::cout);
-    return report;
+// Open the engine (replays the WAL into the memtable) and print the
+// recovery reports (Sections 1.8 and 2.7).
+void open_engine(lsm::Engine& engine) {
+    const lsm::EngineRecovery r = engine.open();
+    r.wal.print(std::cout);
+    std::cout << "recovery: memtable_keys=" << r.memtable_keys
+              << " memtable_bytes=" << r.memtable_bytes
+              << " last_seqno=" << r.wal.last_seqno << '\n';
 }
 
 int run_mutation(const std::string& cmd,
@@ -94,16 +97,17 @@ int run_mutation(const std::string& cmd,
         auto val_it = flags.find("value");
         const std::string_view value = val_it != flags.end() ? val_it->second : std::string_view{};
         const std::uint64_t seqno = engine.put(key, value);
-        std::cout << "OK put key=" << key << " seqno=" << seqno << '\n';
+        std::cout << "ok seqno=" << seqno
+                  << " memtable_bytes=" << engine.memtable_stats().active_bytes << '\n';
     } else if (cmd == "del") {
         const std::uint64_t seqno = engine.remove(key);
-        std::cout << "OK del key=" << key << " seqno=" << seqno << '\n';
+        std::cout << "ok seqno=" << seqno
+                  << " memtable_bytes=" << engine.memtable_stats().active_bytes << '\n';
     } else { // get
-        try {
-            (void)engine.get(key);
-        } catch (const lsm::Error& e) {
-            if (e.code() != lsm::ErrorCode::NotImplemented) throw;
-            std::cout << "Get(" << key << ") — not implemented yet\n";
+        if (const auto value = engine.get(key)) {
+            std::cout << *value << '\n';
+        } else {
+            std::cout << "NOT FOUND\n";
         }
     }
 
@@ -122,8 +126,14 @@ int run_stats(const fs::path& config_path) {
               << "wal.total_segments="       << s.total_segments << '\n'
               << "wal.last_seqno="           << s.last_seqno << '\n'
               << "wal.fsync_every_n="        << s.fsync_every_n << '\n'
-              << "wal.segment_roll_bytes="   << s.roll_bytes << '\n'
-              << "engine status: wal (get available in Section 2)\n";
+              << "wal.segment_roll_bytes="   << s.roll_bytes << '\n';
+    const lsm::MemtableStats m = engine.memtable_stats();
+    std::cout << "memtable.active_entries="         << m.active_entries << '\n'
+              << "memtable.active_bytes="           << m.active_bytes << '\n'
+              << "memtable.immutables_count="       << m.immutables_count << '\n'
+              << "memtable.immutables_bytes_total=" << m.immutables_bytes_total << '\n'
+              << "memtable.flush_requested="        << m.flush_requested << '\n'
+              << "engine status: wal+memtable (flush to SSTables arrives in Section 3)\n";
     engine.close();
     return 0;
 }

@@ -18,6 +18,8 @@ std::string_view to_string(LogLevel level) noexcept;
 struct Config {
     std::string   data_dir              = "./data";
     std::uint64_t memtable_max_bytes    = 67108864;   // 64 MiB, target size before flush
+    std::uint32_t max_immutable_tables  = 4;          // backpressure threshold (Section 2.6)
+    std::uint32_t memtable_size_overhead_bytes_per_entry = 32;  // accounting only (2.5)
     std::uint32_t block_size            = 8192;       // 8 KiB, target SSTable block size
     double        bloom_false_positive  = 0.01;       // target Bloom FP rate
     std::uint32_t wal_fsync_every_n     = 1;          // fsync every N writes
