@@ -30,7 +30,9 @@ void print_usage(std::ostream& os) {
           "  probe --absent N           N gets of random absent keys (bloom demo)\n"
           "  sst-info --file F          footer, index, bloom and block-size details\n"
           "  del   --key K              WAL append + memtable tombstone\n"
-          "  stats                      print config, WAL/memtable/SSTable stats\n"
+          "  stats                      print config, WAL/memtable/SSTable/version stats\n"
+          "  manifest-info              manifest epoch and live table listing\n"
+          "  version-info               current Version: epoch/id, immutables, SSTables\n"
           "  close                      finish appends, sync, exit cleanly\n"
           "  flush-now                  flush pending immutable memtables to SSTables\n"
           "  list-sst                   list live SSTables from the manifest\n"
@@ -129,6 +131,10 @@ void open_engine(lsm::Engine& engine) {
         std::cout << " tmp_files_removed=" << r.tmp_files_removed;
     }
     std::cout << '\n';
+    std::cout << "startup: manifest_tables=" << r.sst_count
+              << " epoch=" << r.epoch
+              << " wal_records=" << r.wal.records
+              << " version_published=" << r.version_published << '\n';
 }
 
 int run_mutation(const std::string& cmd,
@@ -223,7 +229,10 @@ int run_stats(const lsm::Config& cfg) {
               << "sst.total_bytes=" << t.sst_total_bytes << '\n'
               << "sst.newest_id="   << t.newest_id << '\n';
     print_read_stats(engine);
-    std::cout << "engine status: full single-process read/write path (compaction pending)\n";
+    const auto version = engine.current_version();
+    std::cout << "version.epoch="  << version->epoch << '\n'
+              << "version.id="     << version->id << '\n'
+              << "engine status: full single-process read/write path (compaction pending)\n";
     engine.close();
     return 0;
 }
@@ -309,6 +318,45 @@ int main(int argc, char** argv) {
                 std::cout << "flushed " << r.file_name << " bytes=" << r.file_size
                           << " entries=" << r.entries
                           << " seqno=[" << r.min_seqno << ".." << r.max_seqno << "]\n";
+            }
+            engine.close();
+            return 0;
+        }
+
+        if (cmd == "manifest-info") {
+            lsm::Engine engine(cfg);
+            open_engine(engine);
+            const lsm::Manifest& m = engine.manifest();
+            std::cout << "manifest: epoch=" << m.epoch()
+                      << " tables=" << m.tables().size()
+                      << " next_sst_id=" << m.next_id()
+                      << " total_bytes=" << m.total_bytes() << '\n';
+            for (const auto& t : m.tables()) {   // newest first
+                std::cout << "  " << t.file_name << " size=" << t.file_size
+                          << " keys=[" << t.min_key << ".." << t.max_key << "]"
+                          << " seqno=[" << t.min_seqno << ".." << t.max_seqno << "]\n";
+            }
+            engine.close();
+            return 0;
+        }
+
+        if (cmd == "version-info") {
+            lsm::Engine engine(cfg);
+            open_engine(engine);
+            const auto v = engine.current_version();
+            std::cout << "version: id=" << v->id << " epoch=" << v->epoch
+                      << " active_bytes=" << v->active->bytes()
+                      << " immutables=" << v->immutables.size()
+                      << " sstables=" << v->tables.size() << '\n';
+            std::size_t i = 0;
+            for (const auto& imm : v->immutables) {   // newest first
+                std::cout << "  immutable[" << i++ << "] entries=" << imm->entries()
+                          << " bytes=" << imm->bytes() << '\n';
+            }
+            for (const auto& table : v->tables) {     // newest first
+                const auto& meta = table->meta();
+                std::cout << "  sst " << meta.file_name
+                          << " seqno=[" << meta.min_seqno << ".." << meta.max_seqno << "]\n";
             }
             engine.close();
             return 0;

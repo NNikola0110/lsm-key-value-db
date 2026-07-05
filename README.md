@@ -3,13 +3,12 @@
 A single-node LSM (Log-Structured Merge) key-value store — Phase A.
 Language: **C++23**. Build: **CMake**.
 
-Progress: **Section 4 (SSTable reader)** is implemented. The full single-node
-read/write path works: `put`/`del` append durably to the WAL and update the
-memtable; `flush-now` publishes SSTables atomically; `get` searches active →
-immutables (newest→oldest) → SSTables (newest→oldest), using Bloom filters to
-skip tables, a sparse-index binary search to pick one data block, and restart
-points to search inside it. Verified blocks live in an LRU cache. Next up:
-manifest versioning (5) and compaction (6).
+Progress: **Section 5 (Manifest & Versioning)** is implemented. On top of the
+full read/write path (WAL → memtable → SSTables with Bloom/index/cache reads),
+every change to the table set now goes through an atomic **Version publish**:
+the manifest carries a monotonic `epoch`, readers grab an immutable `Version`
+snapshot per lookup, and rotation/flush swap in a fresh Version with a single
+pointer assignment. Next up: compaction (6).
 
 ## Build
 
@@ -34,6 +33,8 @@ build/lsmkv get --key foo --log-level debug   # adds a per-lookup trace line
 build/lsmkv probe --key foo --repeat 1000     # hot-key loop: shows cache hits
 build/lsmkv probe --absent 1000               # absent keys: shows bloom skips
 build/lsmkv sst-info --file 000001.sst        # footer, index, blocks, bloom details
+build/lsmkv manifest-info                     # epoch + live table listing (newest first)
+build/lsmkv version-info                      # current Version: id/epoch, immutables, SSTs
 build/lsmkv stats                      # config + WAL stats + memtable stats
 build/lsmkv close                      # finish appends, sync, exit cleanly
 build/lsmkv flush-now                  # flush pending immutables to data/sst/
@@ -118,6 +119,30 @@ Missing `--key` exits with a non-zero code.
 - **Compression:** `snappy`/`lz4` are accepted in config but not linked into
   this build; the writer warns and writes uncompressed.
 
+## Versioning (Section 5)
+
+- **Manifest** (`data/manifest.json`, override with `manifest_path`): the
+  durable source of truth. Carries `manifest_version`, a monotonic `epoch`
+  (+1 per change), `next_sst_id`, and the table list **newest→oldest** — the
+  same order the read path needs. Updates stay atomic (tmp+fsync+rename);
+  a leftover `manifest.json.tmp` is ignored and removed on startup.
+- **Version** (in memory): an immutable snapshot of {active memtable,
+  immutables newest→oldest, SSTable handles newest→oldest, epoch, id}.
+  Rotation and flush build a new Version and publish it with one pointer
+  swap; `get` grabs the current Version once and reads only through it.
+  `shared_ptr` refcounts keep an old Version (and every table it references)
+  alive until its last reader lets go — that is the refcount rule from 5.5.
+  (The CLI is single-threaded today, so the swap is trivially atomic; the
+  discipline is what Section 7's background threads will rely on.)
+- **Startup (5.6):** load manifest → open+validate table handles → replay WAL
+  into the memtable → publish the first Version. Printed as
+  `startup: manifest_tables=N epoch=E wal_records=R version_published=V`
+  (version id = epoch + 1 at startup). Orphan `.sst` files not in the
+  manifest are ignored, never half-visible. A corrupt manifest fails fast
+  with `CorruptionDetected` naming the file.
+- Set `publish_log_level=debug` (or `LSMKV_PUBLISH_LOG_LEVEL=debug`) to log
+  a one-liner for every publish.
+
 ## Read path (Section 4)
 
 - **Lookup order:** active memtable → immutables (newest→oldest) → SSTables
@@ -155,7 +180,8 @@ Keys: `data_dir`, `memtable_max_bytes`, `max_immutable_tables`,
 `sst_dir` (empty = `<data_dir>/sst`), `restart_interval`,
 `max_build_buffer_mb`, `block_cache_mb`, `cache_index_blocks`,
 `max_open_files`, `wal_fsync_every_n`, `wal_segment_roll_bytes`,
-`compression` (`off|snappy|lz4`), `log_level` (`debug|info|warn|error`).
+`compression` (`off|snappy|lz4`), `log_level` (`debug|info|warn|error`),
+`manifest_path` (empty = `<data_dir>/manifest.json`), `publish_log_level`.
 
 Resolution priority (later wins): built-in defaults → config file →
 env vars (`LSMKV_*`) → CLI flags (currently `--log-level`). A missing config

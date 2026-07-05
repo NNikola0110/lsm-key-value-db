@@ -22,13 +22,17 @@ struct TableMeta {
     std::uint32_t bloom_hashes = 0;
 };
 
-// The durable list of live SSTables at data/manifest.json. Updates are
-// atomic: write manifest.json.tmp, fsync, rename over the old file (3.7).
+// The durable source of truth about which SSTables are live (Section 5.3).
+// Tables are kept NEWEST-FIRST both here and in the JSON file — the same
+// order readers need (5.11). Updates are atomic: write manifest.json.tmp,
+// fsync, rename over the old file. `epoch` increments on every change.
 // Keys are stored as JSON strings, so the CLI's UTF-8 keys round-trip; raw
 // binary keys would need escaping (out of scope for this course).
 class Manifest {
 public:
-    // Missing file => empty manifest (fresh store). Invalid JSON => CorruptionDetected.
+    // Missing file => empty manifest (fresh store). Invalid JSON =>
+    // CorruptionDetected naming the file. A leftover .tmp is ignored and
+    // removed (5.3 atomicity rules).
     static Manifest load_or_create(std::filesystem::path path);
 
     // Next SSTable id. Persisted by add_table's save; an id "leaks" if we
@@ -36,10 +40,13 @@ public:
     // on startup and the id gets reused).
     [[nodiscard]] std::uint64_t next_id() const noexcept { return next_sst_id_; }
 
-    // Register a freshly published table and atomically rewrite the file.
+    // Register a freshly published table (prepended: newest first), bump the
+    // epoch and atomically rewrite the file.
     void add_table(const TableMeta& meta);
 
+    // Newest -> oldest.
     [[nodiscard]] const std::vector<TableMeta>& tables() const noexcept { return tables_; }
+    [[nodiscard]] std::uint64_t epoch() const noexcept { return epoch_; }
     [[nodiscard]] std::uint64_t max_seqno() const noexcept;
     [[nodiscard]] std::uint64_t total_bytes() const noexcept;
 
@@ -48,7 +55,8 @@ private:
 
     std::filesystem::path path_;
     std::uint64_t next_sst_id_ = 1;
-    std::vector<TableMeta> tables_;   // oldest first (flush order)
+    std::uint64_t epoch_ = 0;         // monotonic; +1 per manifest change
+    std::vector<TableMeta> tables_;   // newest first
 };
 
 } // namespace lsm

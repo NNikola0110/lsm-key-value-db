@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 
@@ -21,6 +22,12 @@ using json = nlohmann::json;
 Manifest Manifest::load_or_create(fs::path path) {
     Manifest m;
     m.path_ = std::move(path);
+
+    // A leftover .tmp means we crashed before the atomic rename; the real
+    // manifest is authoritative and the .tmp is garbage (5.3).
+    std::error_code tmp_ec;
+    fs::remove(fs::path(m.path_.string() + ".tmp"), tmp_ec);
+
     if (!fs::exists(m.path_)) {
         return m;   // fresh store
     }
@@ -33,6 +40,7 @@ Manifest Manifest::load_or_create(fs::path path) {
     try {
         in >> doc;
         m.next_sst_id_ = doc.at("next_sst_id").get<std::uint64_t>();
+        m.epoch_ = doc.value("epoch", std::uint64_t{0});
         for (const auto& t : doc.at("tables")) {
             TableMeta meta;
             meta.id = t.at("id").get<std::uint64_t>();
@@ -50,9 +58,13 @@ Manifest Manifest::load_or_create(fs::path path) {
         }
     } catch (const json::exception& e) {
         throw Error(ErrorCode::CorruptionDetected,
-                    "invalid manifest JSON: " + std::string(e.what()));
+                    "invalid manifest JSON in " + m.path_.string() + ": " + e.what());
     }
-    // Be defensive about the counter even if the stored value lags behind.
+    // Normalize to newest-first regardless of stored order (ids are
+    // monotonic, so id order == age order), and be defensive about the
+    // counter even if the stored value lags behind.
+    std::sort(m.tables_.begin(), m.tables_.end(),
+              [](const TableMeta& a, const TableMeta& b) { return a.id > b.id; });
     for (const auto& t : m.tables_) {
         m.next_sst_id_ = std::max(m.next_sst_id_, t.id + 1);
     }
@@ -60,14 +72,16 @@ Manifest Manifest::load_or_create(fs::path path) {
 }
 
 void Manifest::add_table(const TableMeta& meta) {
-    tables_.push_back(meta);
+    tables_.insert(tables_.begin(), meta);   // newest first
     next_sst_id_ = std::max(next_sst_id_, meta.id + 1);
+    epoch_ += 1;
     save();
 }
 
 void Manifest::save() const {
     json doc;
-    doc["version"] = 1;
+    doc["manifest_version"] = 1;
+    doc["epoch"] = epoch_;
     doc["next_sst_id"] = next_sst_id_;
     doc["tables"] = json::array();
     for (const auto& t : tables_) {

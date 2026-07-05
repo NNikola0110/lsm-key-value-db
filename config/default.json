@@ -13,5 +13,6 @@
   "wal_fsync_every_n": 1,
   "wal_segment_roll_bytes": 134217728,
   "compression": "off",
-  "log_level": "info"
+  "log_level": "info",
+  "publish_log_level": "info"
 }

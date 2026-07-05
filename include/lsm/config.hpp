@@ -33,6 +33,8 @@ struct Config {
     std::uint64_t wal_segment_roll_bytes = 134217728; // 128 MiB, size-based roll
     Compression   compression           = Compression::Off;
     LogLevel      log_level             = LogLevel::Info;
+    std::string   manifest_path         = "";         // empty = <data_dir>/manifest.json
+    LogLevel      publish_log_level     = LogLevel::Info;  // debug => log every publish
 
     // Resolution priority (later overrides earlier):
     //   built-in defaults -> config file -> env vars (LSMKV_*).
@@ -46,6 +48,11 @@ struct Config {
     [[nodiscard]] std::filesystem::path resolved_sst_dir() const {
         return sst_dir.empty() ? std::filesystem::path(data_dir) / "sst"
                                : std::filesystem::path(sst_dir);
+    }
+
+    [[nodiscard]] std::filesystem::path resolved_manifest_path() const {
+        return manifest_path.empty() ? std::filesystem::path(data_dir) / "manifest.json"
+                                     : std::filesystem::path(manifest_path);
     }
 };
 

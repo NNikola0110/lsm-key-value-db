@@ -54,22 +54,24 @@ EngineRecovery Engine::open() {
         }
     }
 
-    manifest_ = Manifest::load_or_create(fs::path(config_.data_dir) / "manifest.json");
+    manifest_ = Manifest::load_or_create(config_.resolved_manifest_path());
+    version_id_ = manifest_.epoch();
     block_cache_ = std::make_unique<BlockCache>(
         static_cast<std::uint64_t>(config_.block_cache_mb) * 1024 * 1024);
     fd_pool_ = std::make_unique<FdPool>(config_.max_open_files);
+    // Manifest is newest-first; keep readers_ in the same order (5.11).
     for (const auto& t : manifest_.tables()) {
         if (!fs::exists(sst_dir / t.file_name)) {
             throw Error(ErrorCode::CorruptionDetected,
                         "manifest references missing SSTable: " + t.file_name);
         }
-        auto reader = std::make_unique<TableReader>(sst_dir / t.file_name, t, config_);
+        auto reader = std::make_shared<TableReader>(sst_dir / t.file_name, t, config_);
         reader->validate_footer();   // quick open check (4.3 A)
         readers_.push_back(std::move(reader));
     }
     recovery.sst_count = manifest_.tables().size();
 
-    active_ = std::make_unique<Memtable>(config_.memtable_size_overhead_bytes_per_entry);
+    active_ = std::make_shared<Memtable>(config_.memtable_size_overhead_bytes_per_entry);
     wal_ = std::make_unique<Wal>(fs::path(config_.data_dir) / "wal",
                                  config_.wal_fsync_every_n,
                                  config_.wal_segment_roll_bytes);
@@ -89,7 +91,31 @@ EngineRecovery Engine::open() {
 
     recovery.memtable_keys = active_->entries();
     recovery.memtable_bytes = active_->bytes();
+
+    // Startup publish (5.6): the first Version readers can use — manifest
+    // tables plus the memtables rebuilt from the WAL.
+    publish_version("startup");
+    recovery.epoch = manifest_.epoch();
+    recovery.version_published = current_version_->id;
     return recovery;
+}
+
+void Engine::publish_version(const char* reason) {
+    auto v = std::make_shared<Version>();
+    v->id = ++version_id_;
+    v->epoch = manifest_.epoch();
+    v->active = active_;
+    v->immutables = immutables_;
+    v->tables = readers_;
+    current_version_ = std::move(v);   // atomic pointer swap: readers holding
+                                       // the old Version keep using it (5.5)
+    if (config_.publish_log_level == LogLevel::Debug) {
+        std::cerr << "publish: version=" << current_version_->id
+                  << " epoch=" << current_version_->epoch
+                  << " immutables=" << immutables_.size()
+                  << " sst=" << readers_.size()
+                  << " reason=" << reason << '\n';
+    }
 }
 
 void Engine::ensure_open() const {
@@ -145,22 +171,26 @@ std::optional<std::string> Engine::get(std::string_view key, GetTrace* trace) {
     GetTrace local;
     GetTrace& t = trace ? *trace : local;
 
+    // Grab the current Version once and read only through it (5.7). The
+    // shared_ptr keeps everything in it alive even if a publish happens.
+    const std::shared_ptr<const Version> v = current_version_;
+
     // Global read order (4.3 C): active -> immutables (newest->oldest) ->
     // SSTables (newest->oldest). First hit wins; a tombstone means NOT FOUND
     // and stops the search.
-    if (const MemEntry* e = active_->find(key)) {
+    if (const MemEntry* e = v->active->find(key)) {
         t.memtable_hit = true;
         return e->tombstone ? std::nullopt : std::optional<std::string>(e->value);
     }
-    for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
+    for (const auto& imm : v->immutables) {      // stored newest-first
         t.immutables_consulted += 1;
-        if (const MemEntry* e = (*it)->find(key)) {
+        if (const MemEntry* e = imm->find(key)) {
             return e->tombstone ? std::nullopt : std::optional<std::string>(e->value);
         }
     }
-    for (auto it = readers_.rbegin(); it != readers_.rend(); ++it) {
+    for (const auto& table : v->tables) {        // stored newest-first
         t.sstables_consulted += 1;
-        if (const auto hit = (*it)->get(key, *block_cache_, *fd_pool_, read_stats_, t)) {
+        if (const auto hit = table->get(key, *block_cache_, *fd_pool_, read_stats_, t)) {
             return hit->tombstone ? std::nullopt : std::optional<std::string>(hit->value);
         }
     }
@@ -196,9 +226,14 @@ void Engine::maybe_rotate(bool replaying) {
         wal_->roll();
     }
 
-    immutables_.push_back(std::move(active_));
-    active_ = std::make_unique<Memtable>(config_.memtable_size_overhead_bytes_per_entry);
+    immutables_.insert(immutables_.begin(), std::move(active_));   // newest first
+    active_ = std::make_shared<Memtable>(config_.memtable_size_overhead_bytes_per_entry);
     flush_requested_ += 1;
+
+    // Publish the new table set; replay publishes once at the end of open().
+    if (!replaying) {
+        publish_version("rotation");
+    }
 }
 
 std::vector<SstBuildResult> Engine::flush_pending() {
@@ -207,7 +242,7 @@ std::vector<SstBuildResult> Engine::flush_pending() {
     const fs::path sst_dir = config_.resolved_sst_dir();
 
     while (!immutables_.empty()) {
-        const Memtable& oldest = *immutables_.front();
+        const Memtable& oldest = *immutables_.back();   // newest-first list
 
         SstBuildResult r = write_sstable(sst_dir, manifest_.next_id(), oldest, config_);
 
@@ -223,9 +258,11 @@ std::vector<SstBuildResult> Engine::flush_pending() {
         meta.entries = r.entries;
         meta.bloom_bits_per_key = r.bloom_bits_per_key;
         meta.bloom_hashes = r.bloom_hashes;
-        manifest_.add_table(meta);         // atomic manifest update (3.7)
-        readers_.push_back(std::make_unique<TableReader>(sst_dir / r.file_name, meta, config_));
-        immutables_.erase(immutables_.begin());   // reclaim RAM (3.4 step 10)
+        manifest_.add_table(meta);         // atomic manifest update (3.7); epoch += 1
+        readers_.insert(readers_.begin(),  // newest first, matching the manifest
+                        std::make_shared<TableReader>(sst_dir / r.file_name, meta, config_));
+        immutables_.pop_back();            // reclaim RAM (3.4 step 10)
+        publish_version("flush");          // readers see the swap atomically (5.5)
 
         // Watermark cleanup: memtables are strictly seqNo-ordered, so every
         // WAL record at or below the flushed max seqNo is covered by an
@@ -271,8 +308,8 @@ SstStats Engine::sst_stats() const {
     SstStats s;
     s.sst_count = manifest_.tables().size();
     s.sst_total_bytes = manifest_.total_bytes();
-    for (const auto& t : manifest_.tables()) {
-        s.newest_id = std::max(s.newest_id, t.id);
+    if (!manifest_.tables().empty()) {
+        s.newest_id = manifest_.tables().front().id;   // newest first
     }
     return s;
 }

@@ -96,6 +96,7 @@ Config Config::load(const std::filesystem::path& config_path) {
             "sst_dir", "restart_interval", "max_build_buffer_mb",
             "block_cache_mb", "cache_index_blocks", "max_open_files",
             "wal_fsync_every_n", "wal_segment_roll_bytes", "compression", "log_level",
+            "manifest_path", "publish_log_level",
         };
 
         for (auto it = doc.begin(); it != doc.end(); ++it) {
@@ -122,6 +123,8 @@ Config Config::load(const std::filesystem::path& config_path) {
             else if (key == "wal_segment_roll_bytes") cfg.wal_segment_roll_bytes = v.get<std::uint64_t>();
             else if (key == "compression")         cfg.compression = parse_compression(v.get<std::string>());
             else if (key == "log_level")           cfg.log_level = log_level_from_string(v.get<std::string>());
+            else if (key == "manifest_path")       cfg.manifest_path = v.get<std::string>();
+            else if (key == "publish_log_level")   cfg.publish_log_level = log_level_from_string(v.get<std::string>());
         }
     }
     // Missing file falls through with defaults; both paths still honor env overrides.
@@ -148,6 +151,8 @@ void Config::apply_env() {
     if (auto v = env("LSMKV_WAL_SEGMENT_ROLL_BYTES")) wal_segment_roll_bytes = std::stoull(*v);
     if (auto v = env("LSMKV_COMPRESSION"))          compression = parse_compression(*v);
     if (auto v = env("LSMKV_LOG_LEVEL"))            log_level = log_level_from_string(*v);
+    if (auto v = env("LSMKV_MANIFEST_PATH"))        manifest_path = *v;
+    if (auto v = env("LSMKV_PUBLISH_LOG_LEVEL"))    publish_log_level = log_level_from_string(*v);
 }
 
 void Config::print(std::ostream& os) const {
@@ -166,7 +171,9 @@ void Config::print(std::ostream& os) const {
        << "wal_fsync_every_n="     << wal_fsync_every_n         << '\n'
        << "wal_segment_roll_bytes=" << wal_segment_roll_bytes   << '\n'
        << "compression="           << to_string(compression)    << '\n'
-       << "log_level="             << to_string(log_level)      << '\n';
+       << "log_level="             << to_string(log_level)      << '\n'
+       << "manifest_path="         << resolved_manifest_path().string() << '\n'
+       << "publish_log_level="     << to_string(publish_log_level) << '\n';
 }
 
 } // namespace lsm

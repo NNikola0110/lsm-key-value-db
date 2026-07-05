@@ -15,14 +15,27 @@
 
 namespace lsm {
 
+// An immutable snapshot of everything a reader should see (Section 5.4).
+// Published by an atomic pointer swap; shared_ptr refcounts keep a Version
+// (and the tables it references) alive while any reader still uses it.
+struct Version {
+    std::uint64_t id    = 0;   // in-memory publish counter ("version_id")
+    std::uint64_t epoch = 0;   // manifest epoch at publish time
+    std::shared_ptr<Memtable> active;
+    std::vector<std::shared_ptr<Memtable>> immutables;    // newest -> oldest
+    std::vector<std::shared_ptr<TableReader>> tables;     // newest -> oldest
+};
+
 // What Engine::open() found: WAL replay results plus the rebuilt memtable
-// state (Section 2.7 recovery summary).
+// state (Section 2.7 recovery summary) and version info (5.6).
 struct EngineRecovery {
     WalRecoveryReport wal;
     std::uint64_t memtable_keys  = 0;   // entries in the active memtable
     std::uint64_t memtable_bytes = 0;
     std::uint64_t sst_count      = 0;   // live tables from the manifest
     std::uint64_t tmp_files_removed = 0; // leftover *.sst.tmp cleaned up (3.9)
+    std::uint64_t epoch          = 0;   // manifest epoch after load
+    std::uint64_t version_published = 0; // id of the startup Version
 };
 
 struct MemtableStats {
@@ -50,6 +63,10 @@ struct SstStats {
 // (newest->oldest) -> SSTables (newest->oldest), first hit wins, tombstones
 // mean NOT FOUND. Each SSTable lookup goes Bloom -> sparse index -> one data
 // block, with verified blocks kept in an LRU cache.
+//
+// As of Section 5, every change to the table set (rotation, flush) builds a
+// fresh immutable Version and publishes it with a pointer swap; Get grabs
+// the current Version once and only reads objects inside it (5.7).
 class Engine {
 public:
     explicit Engine(Config config);
@@ -77,6 +94,9 @@ public:
     [[nodiscard]] const Manifest& manifest() const { return manifest_; }
     [[nodiscard]] const ReadStats& read_stats() const noexcept { return read_stats_; }
     [[nodiscard]] std::size_t sstables_open() const noexcept { return fd_pool_->open_count(); }
+    [[nodiscard]] std::shared_ptr<const Version> current_version() const noexcept {
+        return current_version_;
+    }
 
 private:
     void ensure_open() const;
@@ -84,13 +104,16 @@ private:
     void apply_mutation(std::string_view key, std::string_view value,
                         std::uint64_t seqno, bool tombstone, bool replaying);
     void maybe_rotate(bool replaying);
+    void publish_version(const char* reason);   // build + atomic swap (5.5)
 
     Config config_;
     std::unique_ptr<Wal> wal_;
-    std::unique_ptr<Memtable> active_;
-    std::vector<std::unique_ptr<Memtable>> immutables_;   // oldest first
+    std::shared_ptr<Memtable> active_;
+    std::vector<std::shared_ptr<Memtable>> immutables_;   // newest first
     Manifest manifest_;
-    std::vector<std::unique_ptr<TableReader>> readers_;   // oldest first (manifest order)
+    std::vector<std::shared_ptr<TableReader>> readers_;   // newest first (manifest order)
+    std::shared_ptr<const Version> current_version_;
+    std::uint64_t version_id_ = 0;
     std::unique_ptr<BlockCache> block_cache_;
     std::unique_ptr<FdPool> fd_pool_;
     ReadStats read_stats_;
