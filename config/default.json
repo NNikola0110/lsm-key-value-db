@@ -4,6 +4,7 @@
   "block_size": 8192,
   "bloom_false_positive": 0.01,
   "wal_fsync_every_n": 1,
+  "wal_segment_roll_bytes": 134217728,
   "compression": "off",
   "log_level": "info"
 }

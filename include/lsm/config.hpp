@@ -21,6 +21,7 @@ struct Config {
     std::uint32_t block_size            = 8192;       // 8 KiB, target SSTable block size
     double        bloom_false_positive  = 0.01;       // target Bloom FP rate
     std::uint32_t wal_fsync_every_n     = 1;          // fsync every N writes
+    std::uint64_t wal_segment_roll_bytes = 134217728; // 128 MiB, size-based roll
     Compression   compression           = Compression::Off;
     LogLevel      log_level             = LogLevel::Info;
 
