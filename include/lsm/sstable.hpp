@@ -50,4 +50,21 @@ SstBuildResult write_sstable(const std::filesystem::path& sst_dir, std::uint64_t
 // index, filter). Returns "OK" or a description of where corruption was found.
 std::string verify_sstable(const std::filesystem::path& file);
 
+// Footer/index/Bloom overview for `lsmkv sst-info` (Section 4.7).
+struct SstInfo {
+    std::uint64_t file_size = 0;
+    std::uint32_t version = 0;
+    std::uint64_t index_off = 0, index_size = 0;
+    std::uint64_t filter_off = 0, filter_size = 0;
+    std::uint64_t data_blocks = 0;      // = index entry count
+    std::uint32_t block_min = 0, block_max = 0;
+    double        block_avg = 0.0;
+    std::uint64_t bloom_bits = 0;
+    std::uint32_t bloom_hashes = 0;
+    std::uint64_t bloom_keys = 0;
+};
+
+// Throws CorruptionDetected on bad magic/checksums.
+SstInfo inspect_sstable(const std::filesystem::path& file);
+
 } // namespace lsm

@@ -13,6 +13,7 @@ enum class LogLevel { Debug, Info, Warn, Error };
 
 std::string_view to_string(Compression compression) noexcept;
 std::string_view to_string(LogLevel level) noexcept;
+LogLevel log_level_from_string(const std::string& s);   // throws InvalidArgument
 
 // Engine configuration (Section 0.4). All tunables live here with sane defaults.
 struct Config {
@@ -25,6 +26,9 @@ struct Config {
     std::string   sst_dir               = "";         // empty = <data_dir>/sst (Section 3.10)
     std::uint32_t restart_interval      = 16;         // entries per restart point
     std::uint32_t max_build_buffer_mb   = 32;         // advisory cap while building SSTs
+    std::uint32_t block_cache_mb        = 64;         // LRU cache for data blocks (4.4)
+    bool          cache_index_blocks    = true;       // pin index blocks in memory
+    std::uint32_t max_open_files        = 1024;       // FD budget for SSTable readers
     std::uint32_t wal_fsync_every_n     = 1;          // fsync every N writes
     std::uint64_t wal_segment_roll_bytes = 134217728; // 128 MiB, size-based roll
     Compression   compression           = Compression::Off;

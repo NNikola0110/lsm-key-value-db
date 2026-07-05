@@ -10,6 +10,7 @@
 #include "lsm/manifest.hpp"
 #include "lsm/memtable.hpp"
 #include "lsm/sstable.hpp"
+#include "lsm/table_reader.hpp"
 #include "lsm/wal.hpp"
 
 namespace lsm {
@@ -45,9 +46,10 @@ struct SstStats {
 // deletes WAL segments via the watermark policy (3.8): a segment whose max
 // seqNo <= the manifest's max flushed seqNo is fully covered by SSTables.
 //
-// Reads are still memory-only (active -> immutables, newest->oldest);
-// SSTable reads arrive in Section 4. NOTE the consequence: once data is
-// flushed and its WAL segments are deleted, Get cannot see it until then.
+// As of Section 4, Get reads all the way to disk: active -> immutables
+// (newest->oldest) -> SSTables (newest->oldest), first hit wins, tombstones
+// mean NOT FOUND. Each SSTable lookup goes Bloom -> sparse index -> one data
+// block, with verified blocks kept in an LRU cache.
 class Engine {
 public:
     explicit Engine(Config config);
@@ -58,7 +60,8 @@ public:
     EngineRecovery open();
 
     std::uint64_t put(std::string_view key, std::string_view value);  // returns seqNo
-    std::optional<std::string> get(std::string_view key);             // nullopt = NOT FOUND
+    // nullopt = NOT FOUND. Fills *trace (if given) for debug logging.
+    std::optional<std::string> get(std::string_view key, GetTrace* trace = nullptr);
     std::uint64_t remove(std::string_view key);                       // Delete; returns seqNo
     void close();
 
@@ -72,6 +75,8 @@ public:
     [[nodiscard]] MemtableStats memtable_stats() const;
     [[nodiscard]] SstStats sst_stats() const;
     [[nodiscard]] const Manifest& manifest() const { return manifest_; }
+    [[nodiscard]] const ReadStats& read_stats() const noexcept { return read_stats_; }
+    [[nodiscard]] std::size_t sstables_open() const noexcept { return fd_pool_->open_count(); }
 
 private:
     void ensure_open() const;
@@ -85,6 +90,10 @@ private:
     std::unique_ptr<Memtable> active_;
     std::vector<std::unique_ptr<Memtable>> immutables_;   // oldest first
     Manifest manifest_;
+    std::vector<std::unique_ptr<TableReader>> readers_;   // oldest first (manifest order)
+    std::unique_ptr<BlockCache> block_cache_;
+    std::unique_ptr<FdPool> fd_pool_;
+    ReadStats read_stats_;
     std::uint64_t flush_requested_ = 0;
     bool backpressure_warned_ = false;
     bool closed_ = false;

@@ -55,11 +55,17 @@ EngineRecovery Engine::open() {
     }
 
     manifest_ = Manifest::load_or_create(fs::path(config_.data_dir) / "manifest.json");
+    block_cache_ = std::make_unique<BlockCache>(
+        static_cast<std::uint64_t>(config_.block_cache_mb) * 1024 * 1024);
+    fd_pool_ = std::make_unique<FdPool>(config_.max_open_files);
     for (const auto& t : manifest_.tables()) {
         if (!fs::exists(sst_dir / t.file_name)) {
             throw Error(ErrorCode::CorruptionDetected,
                         "manifest references missing SSTable: " + t.file_name);
         }
+        auto reader = std::make_unique<TableReader>(sst_dir / t.file_name, t, config_);
+        reader->validate_footer();   // quick open check (4.3 A)
+        readers_.push_back(std::move(reader));
     }
     recovery.sst_count = manifest_.tables().size();
 
@@ -131,19 +137,31 @@ std::uint64_t Engine::remove(std::string_view key) {
     return seqno;
 }
 
-std::optional<std::string> Engine::get(std::string_view key) {
+std::optional<std::string> Engine::get(std::string_view key, GetTrace* trace) {
     ensure_open();
     if (key.empty()) {
         throw Error(ErrorCode::InvalidArgument, "empty key is not allowed");
     }
-    // Active first, then immutables newest->oldest; first hit wins,
-    // tombstone means NOT FOUND (2.4 B). SSTables are consulted in Section 4.
+    GetTrace local;
+    GetTrace& t = trace ? *trace : local;
+
+    // Global read order (4.3 C): active -> immutables (newest->oldest) ->
+    // SSTables (newest->oldest). First hit wins; a tombstone means NOT FOUND
+    // and stops the search.
     if (const MemEntry* e = active_->find(key)) {
+        t.memtable_hit = true;
         return e->tombstone ? std::nullopt : std::optional<std::string>(e->value);
     }
     for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
+        t.immutables_consulted += 1;
         if (const MemEntry* e = (*it)->find(key)) {
             return e->tombstone ? std::nullopt : std::optional<std::string>(e->value);
+        }
+    }
+    for (auto it = readers_.rbegin(); it != readers_.rend(); ++it) {
+        t.sstables_consulted += 1;
+        if (const auto hit = (*it)->get(key, *block_cache_, *fd_pool_, read_stats_, t)) {
+            return hit->tombstone ? std::nullopt : std::optional<std::string>(hit->value);
         }
     }
     return std::nullopt;
@@ -206,6 +224,7 @@ std::vector<SstBuildResult> Engine::flush_pending() {
         meta.bloom_bits_per_key = r.bloom_bits_per_key;
         meta.bloom_hashes = r.bloom_hashes;
         manifest_.add_table(meta);         // atomic manifest update (3.7)
+        readers_.push_back(std::make_unique<TableReader>(sst_dir / r.file_name, meta, config_));
         immutables_.erase(immutables_.begin());   // reclaim RAM (3.4 step 10)
 
         // Watermark cleanup: memtables are strictly seqNo-ordered, so every

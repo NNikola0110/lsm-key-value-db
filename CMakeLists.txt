@@ -26,6 +26,7 @@ add_executable(lsmkv
   src/manifest.cpp
   src/memtable.cpp
   src/sstable.cpp
+  src/table_reader.cpp
   src/wal.cpp
 )
 target_include_directories(lsmkv PRIVATE include)

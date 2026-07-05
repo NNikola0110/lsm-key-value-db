@@ -267,6 +267,80 @@ SstBuildResult write_sstable(const fs::path& sst_dir, std::uint64_t id,
     return result;
 }
 
+SstInfo inspect_sstable(const fs::path& file) {
+    std::FILE* f = std::fopen(file.string().c_str(), "rb");
+    if (!f) {
+        throw Error(ErrorCode::IOFailure, "cannot open SSTable: " + file.string());
+    }
+
+    auto fail = [&](const std::string& what) -> void {
+        std::fclose(f);
+        throw Error(ErrorCode::CorruptionDetected, file.filename().string() + ": " + what);
+    };
+    auto read_at = [&](std::uint64_t off, std::vector<unsigned char>& buf) {
+        if (std::fseek(f, static_cast<long>(off), SEEK_SET) != 0 ||
+            std::fread(buf.data(), 1, buf.size(), f) != buf.size()) {
+            fail("short read at offset " + std::to_string(off));
+        }
+    };
+
+    SstInfo info;
+    std::error_code ec;
+    info.file_size = fs::file_size(file, ec);
+    if (ec || info.file_size < kFooterSize) fail("file too small for footer");
+
+    std::vector<unsigned char> footer(kFooterSize);
+    read_at(info.file_size - kFooterSize, footer);
+    if (get_u32(footer.data() + 36) != kMagic) fail("bad footer magic");
+    info.version = get_u32(footer.data() + 32);
+    info.index_off = get_u64(footer.data());
+    info.index_size = get_u64(footer.data() + 8);
+    info.filter_off = get_u64(footer.data() + 16);
+    info.filter_size = get_u64(footer.data() + 24);
+    if (info.index_off + info.index_size > info.file_size ||
+        info.filter_off + info.filter_size > info.file_size ||
+        info.index_size < 4 || info.filter_size < 24) {
+        fail("footer offsets out of range");
+    }
+
+    std::vector<unsigned char> index_block(info.index_size);
+    read_at(info.index_off, index_block);
+    if (crc32(index_block.data(), info.index_size - 4) !=
+        get_u32(index_block.data() + info.index_size - 4)) {
+        fail("index block checksum mismatch");
+    }
+    std::uint64_t total = 0;
+    std::size_t pos = 0;
+    const std::size_t end = info.index_size - 4;
+    while (pos < end) {
+        if (pos + 4 > end) fail("truncated index entry");
+        const std::uint32_t key_len = get_u32(index_block.data() + pos);
+        pos += 4;
+        if (pos + key_len + 12 > end) fail("truncated index entry");
+        pos += key_len + 8;
+        const std::uint32_t block_size = get_u32(index_block.data() + pos);
+        pos += 4;
+        info.data_blocks += 1;
+        total += block_size;
+        info.block_min = info.block_min == 0 ? block_size : std::min(info.block_min, block_size);
+        info.block_max = std::max(info.block_max, block_size);
+    }
+    info.block_avg = info.data_blocks ? static_cast<double>(total) / info.data_blocks : 0.0;
+
+    std::vector<unsigned char> filter_block(info.filter_size);
+    read_at(info.filter_off, filter_block);
+    if (crc32(filter_block.data(), info.filter_size - 4) !=
+        get_u32(filter_block.data() + info.filter_size - 4)) {
+        fail("filter block checksum mismatch");
+    }
+    info.bloom_bits = get_u64(filter_block.data());
+    info.bloom_hashes = get_u32(filter_block.data() + 8);
+    info.bloom_keys = get_u64(filter_block.data() + 12);
+
+    std::fclose(f);
+    return info;
+}
+
 std::string verify_sstable(const fs::path& file) {
     std::FILE* f = std::fopen(file.string().c_str(), "rb");
     if (!f) return "cannot open file";

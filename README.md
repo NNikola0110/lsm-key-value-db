@@ -3,13 +3,13 @@
 A single-node LSM (Log-Structured Merge) key-value store — Phase A.
 Language: **C++23**. Build: **CMake**.
 
-Progress: **Section 3 (SSTable writer / flush path)** is implemented.
-`put`/`del` append durably to the WAL, then update the memtable; `flush-now`
-writes immutable memtables to sorted, immutable SSTables (atomic temp+rename
-publish, manifest update, WAL cleanup). `get` still reads **memory only** —
-SSTable reads arrive in Section 4, so flushed data is temporarily invisible
-to `get` once its WAL segments are cleaned. This is the spec's intended
-section ordering.
+Progress: **Section 4 (SSTable reader)** is implemented. The full single-node
+read/write path works: `put`/`del` append durably to the WAL and update the
+memtable; `flush-now` publishes SSTables atomically; `get` searches active →
+immutables (newest→oldest) → SSTables (newest→oldest), using Bloom filters to
+skip tables, a sparse-index binary search to pick one data block, and restart
+points to search inside it. Verified blocks live in an LRU cache. Next up:
+manifest versioning (5) and compaction (6).
 
 ## Build
 
@@ -29,7 +29,11 @@ The executable is produced at `build/lsmkv` (or `build/Debug/lsmkv.exe` with MSV
 build/lsmkv init                       # create data/ + data/wal/, print resolved config
 build/lsmkv put --key foo --value bar  # WAL append + memtable; prints: ok seqno=N memtable_bytes=B
 build/lsmkv del --key foo              # WAL append + tombstone; prints: ok seqno=N memtable_bytes=B
-build/lsmkv get --key foo              # prints the value, or NOT FOUND
+build/lsmkv get --key foo              # memtables then SSTables; value or NOT FOUND
+build/lsmkv get --key foo --log-level debug   # adds a per-lookup trace line
+build/lsmkv probe --key foo --repeat 1000     # hot-key loop: shows cache hits
+build/lsmkv probe --absent 1000               # absent keys: shows bloom skips
+build/lsmkv sst-info --file 000001.sst        # footer, index, blocks, bloom details
 build/lsmkv stats                      # config + WAL stats + memtable stats
 build/lsmkv close                      # finish appends, sync, exit cleanly
 build/lsmkv flush-now                  # flush pending immutables to data/sst/
@@ -114,6 +118,25 @@ Missing `--key` exits with a non-zero code.
 - **Compression:** `snappy`/`lz4` are accepted in config but not linked into
   this build; the writer warns and writes uncompressed.
 
+## Read path (Section 4)
+
+- **Lookup order:** active memtable → immutables (newest→oldest) → SSTables
+  (newest→oldest). First hit wins; a tombstone means NOT FOUND and stops the
+  search. Per table: range check (manifest min/max key) → Bloom check →
+  index binary search → one data-block read → restart-point search in-block.
+- **Block cache:** LRU over checksum-verified data blocks, capacity
+  `block_cache_mb` (64 MiB default). Index blocks are pinned per table when
+  `cache_index_blocks=true`; Bloom filters are always pinned once loaded.
+- **FD budget:** at most `max_open_files` SSTables keep an open handle; the
+  least-recently-used reader is closed when the budget is exceeded.
+- **Corruption:** a failed block checksum or bad footer raises
+  `CorruptionDetected` naming the file and offset; the request fails, the
+  process does not crash.
+- **Stats/tracing:** `stats` prints `read.*` counters (bloom checks/negatives,
+  cache hits/misses, disk reads); `get --log-level debug` prints a per-lookup
+  trace. Counters are per-process (the CLI is one-shot), so use `probe` to
+  observe cache/bloom behavior over many lookups in one process.
+
 ## Layout
 
 ```
@@ -130,9 +153,10 @@ tests/                test placeholders (Section 9)
 Keys: `data_dir`, `memtable_max_bytes`, `max_immutable_tables`,
 `memtable_size_overhead_bytes_per_entry`, `block_size`, `bloom_false_positive`,
 `sst_dir` (empty = `<data_dir>/sst`), `restart_interval`,
-`max_build_buffer_mb`, `wal_fsync_every_n`, `wal_segment_roll_bytes`,
+`max_build_buffer_mb`, `block_cache_mb`, `cache_index_blocks`,
+`max_open_files`, `wal_fsync_every_n`, `wal_segment_roll_bytes`,
 `compression` (`off|snappy|lz4`), `log_level` (`debug|info|warn|error`).
 
 Resolution priority (later wins): built-in defaults → config file →
-env vars (`LSMKV_*`) → CLI flags. A missing config file falls back to defaults;
-unknown keys print a warning and are ignored.
+env vars (`LSMKV_*`) → CLI flags (currently `--log-level`). A missing config
+file falls back to defaults; unknown keys print a warning and are ignored.
