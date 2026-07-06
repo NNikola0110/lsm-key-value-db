@@ -386,6 +386,7 @@ void Engine::maybe_rotate(bool replaying) {
         wal_->roll();
     }
 
+    crash_point("CP_ROTATE_BEFORE_ENQUEUE_IMMUTABLE");
     immutables_.insert(immutables_.begin(), std::move(active_));   // newest first
     active_ = std::make_shared<Memtable>(config_.memtable_size_overhead_bytes_per_entry);
     flush_requested_ += 1;
@@ -444,6 +445,7 @@ bool Engine::flush_one() {
     meta.bloom_bits_per_key = r.bloom_bits_per_key;
     meta.bloom_hashes = r.bloom_hashes;
 
+    crash_point("CP_FLUSH_AFTER_RENAME_BEFORE_MANIFEST");
     {
         std::lock_guard st(state_mutex_);
         manifest_.add_table(meta);         // atomic manifest update (3.7); epoch += 1
@@ -711,6 +713,8 @@ Engine::run_compaction(const std::optional<std::vector<std::uint64_t>>& inputs) 
         job.bytes_out = r.file_size;
         job.output_file = r.file_name;
     }
+    crash_point("CP_COMPACTION_AFTER_OUTPUTS_BEFORE_MANIFEST");
+
     // Final cancel checkpoint before anything becomes visible.
     if (cancel_compaction_) {
         if (added) {

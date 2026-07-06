@@ -3,12 +3,12 @@
 A single-node LSM (Log-Structured Merge) key-value store — Phase A.
 Language: **C++23**. Build: **CMake**.
 
-Progress: **Section 8 (observability & tooling)** is implemented. The engine
-explains itself: structured `key=value` log events with locked field names,
-Prometheus metrics, a 10-line human `stats` (plus `--json`/`--full`),
-HTTP endpoints via `lsmkv serve` (/healthz /readyz /metrics /stats), and
-`lsmkv doctor` support bundles. See [docs/observability.md](docs/observability.md)
-for the full charter. Next up: testing & fault injection (9).
+Progress: **Phase A complete (Sections 0–9).** The engine is a crash-safe,
+multi-threaded, observable single-node LSM store, and Section 9 adds the
+proof: unit + property/model-based tests (`lsmkv_tests`, seeds printed on
+failure), 8 named crash points injectable via `LSMKV_CRASHPOINT`, and chaos
+drills A–E. One command runs everything: `sh tests/run_all.sh` — see
+[TESTING.md](TESTING.md). Next: Phase B (Dynamo-style distribution).
 
 ## Build
 
@@ -255,7 +255,7 @@ data/                 runtime files: wal/ segments, sst/ tables, manifest.json
 docs/                 design notes
 include/lsm/          engine headers + api.md, errors.md
 src/                  CLI + engine sources (wal, memtable, sstable, manifest)
-tests/                test placeholders (Section 9)
+tests/                unit_tests.cpp, drills.sh, run_all.sh (see TESTING.md)
 ```
 
 ## Configuration

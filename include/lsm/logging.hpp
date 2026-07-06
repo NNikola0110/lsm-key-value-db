@@ -29,4 +29,10 @@ std::string ts_rfc3339();
 void count_error(ErrorCode code);
 std::uint64_t error_count(ErrorCode code);
 
+// Fault injection (Section 9.4): if the environment variable LSMKV_CRASHPOINT
+// equals `name`, print one line and hard-exit (simulated power cut). The
+// eight annotated points are listed in TESTING.md; names are part of the
+// test contract.
+void crash_point(const char* name);
+
 } // namespace lsm

@@ -3,6 +3,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <iostream>
 #include <mutex>
@@ -53,6 +56,15 @@ void count_error(ErrorCode code) {
 std::uint64_t error_count(ErrorCode code) {
     const auto i = static_cast<std::size_t>(code);
     return i < g_error_counts.size() ? g_error_counts[i].load() : 0;
+}
+
+void crash_point(const char* name) {
+    static const char* target = std::getenv("LSMKV_CRASHPOINT");
+    if (target && std::strcmp(target, name) == 0) {
+        std::fprintf(stderr, "CRASHPOINT %s hit: simulating power cut\n", name);
+        std::fflush(nullptr);
+        std::_Exit(137);   // no destructors, no flushes — like a power cut
+    }
 }
 
 } // namespace lsm
