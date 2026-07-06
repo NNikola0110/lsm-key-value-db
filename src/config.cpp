@@ -100,6 +100,8 @@ Config Config::load(const std::filesystem::path& config_path) {
             "size_tiered_fan_in", "size_tiered_size_ratio", "tombstone_grace_seconds",
             "compaction_max_concurrent", "compaction_io_mb_per_s",
             "l0_compaction_trigger", "l0_stop_writes", "bg_tick_ms", "shutdown_timeout_ms",
+            "metrics_enabled", "http_listen_addr", "stats_sampling_interval_ms",
+            "doctor_bundle_max_mb",
         };
 
         for (auto it = doc.begin(); it != doc.end(); ++it) {
@@ -137,6 +139,11 @@ Config Config::load(const std::filesystem::path& config_path) {
             else if (key == "l0_stop_writes")      cfg.l0_stop_writes = v.get<std::uint32_t>();
             else if (key == "bg_tick_ms")          cfg.bg_tick_ms = v.get<std::uint32_t>();
             else if (key == "shutdown_timeout_ms") cfg.shutdown_timeout_ms = v.get<std::uint32_t>();
+            else if (key == "metrics_enabled")     cfg.metrics_enabled = v.get<bool>();
+            else if (key == "http_listen_addr")    cfg.http_listen_addr = v.get<std::string>();
+            else if (key == "stats_sampling_interval_ms")
+                cfg.stats_sampling_interval_ms = v.get<std::uint32_t>();
+            else if (key == "doctor_bundle_max_mb") cfg.doctor_bundle_max_mb = v.get<std::uint32_t>();
         }
     }
     // Missing file falls through with defaults; both paths still honor env overrides.
@@ -174,6 +181,11 @@ void Config::apply_env() {
     if (auto v = env("LSMKV_L0_STOP_WRITES"))       l0_stop_writes = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_BG_TICK_MS"))           bg_tick_ms = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_SHUTDOWN_TIMEOUT_MS"))  shutdown_timeout_ms = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_METRICS_ENABLED"))      metrics_enabled = parse_bool(*v);
+    if (auto v = env("LSMKV_HTTP_LISTEN_ADDR"))     http_listen_addr = *v;
+    if (auto v = env("LSMKV_STATS_SAMPLING_INTERVAL_MS"))
+        stats_sampling_interval_ms = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_DOCTOR_BUNDLE_MAX_MB")) doctor_bundle_max_mb = static_cast<std::uint32_t>(std::stoul(*v));
 }
 
 void Config::print(std::ostream& os) const {
@@ -203,7 +215,11 @@ void Config::print(std::ostream& os) const {
        << "l0_compaction_trigger=" << l0_compaction_trigger     << '\n'
        << "l0_stop_writes="        << l0_stop_writes            << '\n'
        << "bg_tick_ms="            << bg_tick_ms                << '\n'
-       << "shutdown_timeout_ms="   << shutdown_timeout_ms       << '\n';
+       << "shutdown_timeout_ms="   << shutdown_timeout_ms       << '\n'
+       << "metrics_enabled="       << (metrics_enabled ? "true" : "false") << '\n'
+       << "http_listen_addr="      << http_listen_addr          << '\n'
+       << "stats_sampling_interval_ms=" << stats_sampling_interval_ms << '\n'
+       << "doctor_bundle_max_mb="  << doctor_bundle_max_mb      << '\n';
 }
 
 } // namespace lsm

@@ -44,6 +44,10 @@ struct Config {
     std::uint32_t l0_stop_writes        = 20;         // write stall when tables > this
     std::uint32_t bg_tick_ms            = 500;        // background worker wake-up period
     std::uint32_t shutdown_timeout_ms   = 5000;       // fast-shutdown drain grace period
+    bool          metrics_enabled       = true;       // serve /metrics (Section 8.9)
+    std::string   http_listen_addr      = "127.0.0.1:9090";  // for `lsmkv serve`
+    std::uint32_t stats_sampling_interval_ms = 1000;  // reserved for push metrics
+    std::uint32_t doctor_bundle_max_mb  = 10;         // support bundle size cap
 
     // Resolution priority (later overrides earlier):
     //   built-in defaults -> config file -> env vars (LSMKV_*).

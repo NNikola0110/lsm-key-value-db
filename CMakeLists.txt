@@ -24,6 +24,8 @@ add_executable(lsmkv
   src/compaction.cpp
   src/config.cpp
   src/engine.cpp
+  src/http_server.cpp
+  src/logging.cpp
   src/manifest.cpp
   src/memtable.cpp
   src/sstable.cpp
@@ -32,6 +34,9 @@ add_executable(lsmkv
 )
 target_include_directories(lsmkv PRIVATE include)
 target_link_libraries(lsmkv PRIVATE nlohmann_json::nlohmann_json)
+if(WIN32)
+  target_link_libraries(lsmkv PRIVATE ws2_32)
+endif()
 
 if(MSVC)
   target_compile_options(lsmkv PRIVATE /W4 /utf-8 /permissive-)

@@ -1,6 +1,7 @@
 #include "lsm/engine.hpp"
 
 #include "lsm/errors.hpp"
+#include "lsm/logging.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -40,6 +41,7 @@ Engine::~Engine() {
 }
 
 EngineRecovery Engine::open() {
+    set_log_level(config_.log_level);
     const fs::path sst_dir = config_.resolved_sst_dir();
     std::error_code ec;
     fs::create_directories(config_.data_dir, ec);
@@ -198,16 +200,40 @@ void Engine::publish_version(const char* reason) {
     v->active = active_;
     v->immutables = immutables_;
     v->tables = readers_;
-    const std::uint64_t id = v->id;
-    const std::uint64_t epoch = v->epoch;
+    const std::shared_ptr<const Version> prev = current_version_.load();
     current_version_.store(std::move(v));   // atomic swap: readers holding
                                             // the old Version keep using it (5.5)
     bg_.versions_published_total += 1;
     if (config_.publish_log_level == LogLevel::Debug) {
-        std::cerr << "publish: version=" << id << " epoch=" << epoch
-                  << " immutables=" << immutables_.size()
-                  << " sst=" << readers_.size()
-                  << " reason=" << reason << '\n';
+        // Diff against the previous Version for the 8.3 event fields.
+        auto ids_of = [](const std::shared_ptr<const Version>& ver) {
+            std::vector<std::uint64_t> ids;
+            if (ver) for (const auto& t : ver->tables) ids.push_back(t->meta().id);
+            return ids;
+        };
+        const auto old_ids = ids_of(prev);
+        std::string added, removed;
+        for (const auto& r : readers_) {
+            if (std::find(old_ids.begin(), old_ids.end(), r->meta().id) == old_ids.end()) {
+                added += (added.empty() ? "" : ",") + std::to_string(r->meta().id);
+            }
+        }
+        for (std::uint64_t id : old_ids) {
+            if (std::none_of(readers_.begin(), readers_.end(),
+                             [&](const auto& r) { return r->meta().id == id; })) {
+                removed += (removed.empty() ? "" : ",") + std::to_string(id);
+            }
+        }
+        const std::size_t old_imm = prev ? prev->immutables.size() : 0;
+        const std::size_t imm_removed = old_imm > immutables_.size()
+                                            ? old_imm - immutables_.size() : 0;
+        log_event(LogLevel::Debug, "version_publish",
+                  {{"epoch", std::to_string(manifest_.epoch())},
+                   {"version_id", std::to_string(version_id_)},
+                   {"sst_added", "[" + added + "]"},
+                   {"sst_removed", "[" + removed + "]"},
+                   {"immutables_removed", std::to_string(imm_removed)},
+                   {"reason", reason}});
     }
 }
 
@@ -241,8 +267,10 @@ void Engine::ensure_write_capacity() {
         return;
     }
 
-    std::cerr << "stall: immutables=" << immutables_.size()
-              << " (max=" << config_.max_immutable_tables << ") blocking writes\n";
+    log_event(LogLevel::Warn, "stall_write",
+              {{"immutables", std::to_string(immutables_.size())},
+               {"max_immutables", std::to_string(config_.max_immutable_tables)},
+               {"reason", "backpressure"}});
     bg_.write_stalls_total += 1;
 
     if (!workers_running_) {
@@ -271,6 +299,7 @@ std::uint64_t Engine::put(std::string_view key, std::string_view value) {
     }
     ensure_write_capacity();
     const std::uint64_t seqno = wal_->append_put(key, value);   // durable first
+    bg_.writes_total += 1;
     apply_mutation(key, value, seqno, /*tombstone=*/false, /*replaying=*/false);
     return seqno;
 }
@@ -284,6 +313,7 @@ std::uint64_t Engine::remove(std::string_view key) {
     ensure_write_capacity();
     // Deleting a non-existent key is fine: we still log a DEL record.
     const std::uint64_t seqno = wal_->append_del(key);
+    bg_.writes_total += 1;
     apply_mutation(key, {}, seqno, /*tombstone=*/true, /*replaying=*/false);
     return seqno;
 }
@@ -303,18 +333,22 @@ std::optional<std::string> Engine::get(std::string_view key, GetTrace* trace) {
     // Global read order (4.3 C): active -> immutables (newest->oldest) ->
     // SSTables (newest->oldest). First hit wins; a tombstone means NOT FOUND
     // and stops the search.
+    read_stats_.reads_total += 1;
     if (const auto e = v->active->find(key)) {
         t.memtable_hit = true;
+        read_stats_.hit_memtable_total += 1;
         return e->tombstone ? std::nullopt : std::optional<std::string>(e->value);
     }
     for (const auto& imm : v->immutables) {      // stored newest-first
         t.immutables_consulted += 1;
         if (const auto e = imm->find(key)) {
+            read_stats_.hit_memtable_total += 1;
             return e->tombstone ? std::nullopt : std::optional<std::string>(e->value);
         }
     }
     for (const auto& table : v->tables) {        // stored newest-first
         t.sstables_consulted += 1;
+        read_stats_.sstables_consulted_total += 1;
         if (const auto hit = table->get(key, *block_cache_, *fd_pool_, read_stats_, t)) {
             return hit->tombstone ? std::nullopt : std::optional<std::string>(hit->value);
         }
@@ -358,8 +392,10 @@ void Engine::maybe_rotate(bool replaying) {
 
     // Publish the new table set; replay publishes once at the end of open().
     if (!replaying) {
-        std::cerr << "rotate: active->immutable size=" << immutables_.front()->bytes()
-                  << " immutables=" << immutables_.size() << '\n';
+        log_event(LogLevel::Info, "rotate_memtable",
+                  {{"old_active_bytes", std::to_string(immutables_.front()->bytes())},
+                   {"immutables_after", std::to_string(immutables_.size())},
+                   {"reason", "size"}});
         publish_version("rotation");
         state_cv_.notify_all();   // wake the FlushWorker
     }
@@ -383,7 +419,10 @@ bool Engine::flush_one() {
     }
 
     bg_.flush_running = true;
-    std::cerr << "flush: start bytes=" << target->bytes() << '\n';
+    const std::uint64_t imm_id = bg_.flush_jobs_total + 1;
+    log_event(LogLevel::Info, "flush_start",
+              {{"imm_id", std::to_string(imm_id)},
+               {"bytes", std::to_string(target->bytes())}});
     SstBuildResult r;
     try {
         r = write_sstable(sst_dir, out_id, *target, config_);
@@ -433,9 +472,14 @@ bool Engine::flush_one() {
                         .count();
     bg_.flush_jobs_total += 1;
     bg_.flush_last_ms = static_cast<std::uint64_t>(ms);
+    bg_.sst_bytes_written_total += r.file_size;
     bg_.flush_running = false;
-    std::cerr << "flush: publish sst=" << r.file_name << " bytes=" << r.file_size
-              << " dur=" << ms << "ms\n";
+    log_event(LogLevel::Info, "flush_publish",
+              {{"imm_id", std::to_string(imm_id)},
+               {"sst_id", r.file_name},
+               {"entries", std::to_string(r.entries)},
+               {"bytes", std::to_string(r.file_size)},
+               {"dur_ms", std::to_string(ms)}});
     return true;
 }
 
@@ -570,6 +614,11 @@ Engine::run_compaction(const std::optional<std::vector<std::uint64_t>>& inputs) 
     CompactionJobResult job;
     job.job_id = state.next_job_id;
     job.input_ids = ids;
+
+    std::string ids_str;
+    for (std::uint64_t id : ids) ids_str += (ids_str.empty() ? "" : ",") + std::to_string(id);
+    log_event(LogLevel::Info, "compaction_start",
+              {{"job_id", std::to_string(job.job_id)}, {"inputs", "[" + ids_str + "]"}});
 
     // Gather input metadata (newest-first in ids).
     std::vector<TableMeta> input_meta;
@@ -739,6 +788,17 @@ Engine::run_compaction(const std::optional<std::vector<std::uint64_t>>& inputs) 
 
     bg_.compactions_total += 1;
     bg_.compaction_last_ms = job.duration_ms;
+    bg_.compaction_bytes_in_total += job.bytes_in;
+    bg_.compaction_bytes_out_total += job.bytes_out;
+    log_event(LogLevel::Info, "compaction_done",
+              {{"job_id", std::to_string(job.job_id)},
+               {"inputs", "[" + ids_str + "]"},
+               {"bytes_in", std::to_string(job.bytes_in)},
+               {"bytes_out", std::to_string(job.bytes_out)},
+               {"keys_in", std::to_string(job.keys_in)},
+               {"keys_out", std::to_string(job.keys_out)},
+               {"tombstones_kept", std::to_string(job.tombstones_kept)},
+               {"dur_ms", std::to_string(job.duration_ms)}});
     std::cout << format_job_line(job) << '\n';
     return job;
 }
