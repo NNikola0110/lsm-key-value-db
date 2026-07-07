@@ -23,12 +23,14 @@ add_executable(lsmkv
   src/main.cpp
   src/config.cpp
   src/engine.cpp
+  src/wal.cpp
 )
 target_include_directories(lsmkv PRIVATE include)
 target_link_libraries(lsmkv PRIVATE nlohmann_json::nlohmann_json)
 
 if(MSVC)
   target_compile_options(lsmkv PRIVATE /W4 /utf-8 /permissive-)
+  target_compile_definitions(lsmkv PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
   target_compile_options(lsmkv PRIVATE -Wall -Wextra -Wpedantic)
 endif()

@@ -82,7 +82,7 @@ Config Config::load(const std::filesystem::path& config_path) {
 
         static const std::set<std::string> known = {
             "data_dir", "memtable_max_bytes", "block_size", "bloom_false_positive",
-            "wal_fsync_every_n", "compression", "log_level",
+            "wal_fsync_every_n", "wal_segment_roll_bytes", "compression", "log_level",
         };
 
         for (auto it = doc.begin(); it != doc.end(); ++it) {
@@ -97,6 +97,7 @@ Config Config::load(const std::filesystem::path& config_path) {
             else if (key == "block_size")          cfg.block_size = v.get<std::uint32_t>();
             else if (key == "bloom_false_positive") cfg.bloom_false_positive = v.get<double>();
             else if (key == "wal_fsync_every_n")   cfg.wal_fsync_every_n = v.get<std::uint32_t>();
+            else if (key == "wal_segment_roll_bytes") cfg.wal_segment_roll_bytes = v.get<std::uint64_t>();
             else if (key == "compression")         cfg.compression = parse_compression(v.get<std::string>());
             else if (key == "log_level")           cfg.log_level = parse_log_level(v.get<std::string>());
         }
@@ -113,6 +114,7 @@ void Config::apply_env() {
     if (auto v = env("LSMKV_BLOCK_SIZE"))           block_size = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_BLOOM_FALSE_POSITIVE")) bloom_false_positive = std::stod(*v);
     if (auto v = env("LSMKV_WAL_FSYNC_EVERY_N"))    wal_fsync_every_n = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_WAL_SEGMENT_ROLL_BYTES")) wal_segment_roll_bytes = std::stoull(*v);
     if (auto v = env("LSMKV_COMPRESSION"))          compression = parse_compression(*v);
     if (auto v = env("LSMKV_LOG_LEVEL"))            log_level = parse_log_level(*v);
 }
@@ -123,6 +125,7 @@ void Config::print(std::ostream& os) const {
        << "block_size="            << block_size                << '\n'
        << "bloom_false_positive="  << bloom_false_positive      << '\n'
        << "wal_fsync_every_n="     << wal_fsync_every_n         << '\n'
+       << "wal_segment_roll_bytes=" << wal_segment_roll_bytes   << '\n'
        << "compression="           << to_string(compression)    << '\n'
        << "log_level="             << to_string(log_level)      << '\n';
 }

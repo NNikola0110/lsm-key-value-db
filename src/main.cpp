@@ -1,9 +1,11 @@
-// lsmkv - CLI entry point (Section 0).
-// Commands exist and print helpful messages; storage ops report "not implemented yet".
+// lsmkv - CLI entry point.
+// Section 0: skeleton. Section 1: put/del append to the WAL for real;
+// every command that opens the engine prints the recovery report first.
 
 #include "lsm/config.hpp"
 #include "lsm/engine.hpp"
 #include "lsm/errors.hpp"
+#include "lsm/wal.hpp"
 
 #include <filesystem>
 #include <iostream>
@@ -20,12 +22,14 @@ void print_usage(std::ostream& os) {
     os << "usage: lsmkv <command> [flags]\n"
           "\n"
           "commands:\n"
-          "  init                       prepare data dir, print resolved config\n"
-          "  put   --key K --value V    store a value (not implemented yet)\n"
-          "  get   --key K              read a value (not implemented yet)\n"
-          "  del   --key K              delete a key (not implemented yet)\n"
-          "  stats                      print resolved config and engine status\n"
-          "  close                      close the store\n"
+          "  init                       prepare data/ and data/wal/, print resolved config\n"
+          "  put   --key K --value V    append a PUT record to the WAL\n"
+          "  get   --key K              read a value (not implemented until Section 2)\n"
+          "  del   --key K              append a DEL record to the WAL\n"
+          "  stats                      print config, WAL stats and engine status\n"
+          "  close                      finish appends, sync, exit cleanly\n"
+          "  wal-verify                 scan WAL segments, print a recovery report (read-only)\n"
+          "  wal-truncate --segment S --offset N   truncate a WAL segment (careful!)\n"
           "\n"
           "global flags:\n"
           "  --config PATH              config file (default: config/default.json)\n";
@@ -61,36 +65,93 @@ fs::path resolve_config_path(const std::unordered_map<std::string, std::string>&
     return fs::path("config") / "default.json";
 }
 
+std::string require_flag(const std::unordered_map<std::string, std::string>& flags,
+                         const std::string& name, const std::string& cmd) {
+    auto it = flags.find(name);
+    if (it == flags.end() || it->second.empty()) {
+        throw lsm::Error(lsm::ErrorCode::InvalidArgument,
+                         "--" + name + " is required for '" + cmd + "'");
+    }
+    return it->second;
+}
+
+// Open the engine (replays the WAL) and print the recovery report (1.8).
+lsm::WalRecoveryReport open_engine(lsm::Engine& engine) {
+    const lsm::WalRecoveryReport report = engine.open();
+    report.print(std::cout);
+    return report;
+}
+
 int run_mutation(const std::string& cmd,
                  const std::unordered_map<std::string, std::string>& flags,
                  const fs::path& config_path) {
-    auto key_it = flags.find("key");
-    if (key_it == flags.end() || key_it->second.empty()) {
-        std::cerr << "error: --key is required for '" << cmd << "'\n";
-        return 2;
-    }
-    const std::string& key = key_it->second;
+    const std::string key = require_flag(flags, "key", cmd);
 
-    lsm::Config cfg = lsm::Config::load(config_path);
-    lsm::Engine engine(cfg);
+    lsm::Engine engine(lsm::Config::load(config_path));
+    open_engine(engine);
 
-    try {
-        if (cmd == "put") {
-            auto val_it = flags.find("value");
-            engine.put(key, val_it != flags.end() ? val_it->second : std::string_view{});
-        } else if (cmd == "get") {
+    if (cmd == "put") {
+        auto val_it = flags.find("value");
+        const std::string_view value = val_it != flags.end() ? val_it->second : std::string_view{};
+        const std::uint64_t seqno = engine.put(key, value);
+        std::cout << "OK put key=" << key << " seqno=" << seqno << '\n';
+    } else if (cmd == "del") {
+        const std::uint64_t seqno = engine.remove(key);
+        std::cout << "OK del key=" << key << " seqno=" << seqno << '\n';
+    } else { // get
+        try {
             (void)engine.get(key);
-        } else { // del
-            engine.remove(key);
+        } catch (const lsm::Error& e) {
+            if (e.code() != lsm::ErrorCode::NotImplemented) throw;
+            std::cout << "Get(" << key << ") — not implemented yet\n";
         }
-    } catch (const lsm::Error& e) {
-        if (e.code() == lsm::ErrorCode::NotImplemented) {
-            const char* verb = (cmd == "put") ? "Put" : (cmd == "get") ? "Get" : "Delete";
-            std::cout << verb << '(' << key << ") — not implemented yet\n";
-            return 0;
-        }
-        throw;
     }
+
+    engine.close();
+    return 0;
+}
+
+int run_stats(const fs::path& config_path) {
+    lsm::Engine engine(lsm::Config::load(config_path));
+    open_engine(engine);
+
+    engine.config().print(std::cout);
+    const lsm::WalStats s = engine.wal_stats();
+    std::cout << "wal.active_segment="       << s.active_segment_id << '\n'
+              << "wal.active_segment_bytes=" << s.active_segment_bytes << '\n'
+              << "wal.total_segments="       << s.total_segments << '\n'
+              << "wal.last_seqno="           << s.last_seqno << '\n'
+              << "wal.fsync_every_n="        << s.fsync_every_n << '\n'
+              << "wal.segment_roll_bytes="   << s.roll_bytes << '\n'
+              << "engine status: wal (get available in Section 2)\n";
+    engine.close();
+    return 0;
+}
+
+int run_wal_truncate(const std::unordered_map<std::string, std::string>& flags,
+                     const fs::path& config_path) {
+    const std::string segment = require_flag(flags, "segment", "wal-truncate");
+    const std::string offset_s = require_flag(flags, "offset", "wal-truncate");
+
+    std::uint64_t offset = 0;
+    try {
+        offset = std::stoull(offset_s);
+    } catch (const std::exception&) {
+        throw lsm::Error(lsm::ErrorCode::InvalidArgument, "--offset must be a number");
+    }
+
+    const lsm::Config cfg = lsm::Config::load(config_path);
+    const fs::path path = fs::path(cfg.data_dir) / "wal" / segment;
+    if (!fs::exists(path)) {
+        throw lsm::Error(lsm::ErrorCode::InvalidArgument, "no such segment: " + path.string());
+    }
+    const std::uint64_t size = fs::file_size(path);
+    if (offset > size) {
+        throw lsm::Error(lsm::ErrorCode::InvalidArgument,
+                         "offset " + offset_s + " is beyond segment size " + std::to_string(size));
+    }
+    fs::resize_file(path, offset);
+    std::cout << "truncated " << segment << " from " << size << " to " << offset << " bytes\n";
     return 0;
 }
 
@@ -110,13 +171,11 @@ int main(int argc, char** argv) {
     try {
         if (cmd == "init") {
             lsm::Config cfg = lsm::Config::load(config_path);
-            std::error_code ec;
-            fs::create_directories(cfg.data_dir, ec);
-            if (ec) {
-                throw lsm::Error(lsm::ErrorCode::IOFailure,
-                                 "cannot create data dir '" + cfg.data_dir + "': " + ec.message());
-            }
-            std::cout << "config loaded ✓, data dir ready ✓, manifest placeholder ✓\n";
+            lsm::Engine engine(cfg);
+            open_engine(engine);          // creates data/ and data/wal/
+            engine.close();
+            std::cout << "config loaded ✓, data dir ready ✓, wal dir ready ✓, manifest placeholder ✓\n";
+            cfg.print(std::cout);
             return 0;
         }
 
@@ -125,15 +184,26 @@ int main(int argc, char** argv) {
         }
 
         if (cmd == "stats") {
-            lsm::Config cfg = lsm::Config::load(config_path);
-            cfg.print(std::cout);
-            std::cout << "engine status: stub\n";
-            return 0;
+            return run_stats(config_path);
         }
 
         if (cmd == "close") {
-            std::cout << "closed (stub)\n";
+            lsm::Engine engine(lsm::Config::load(config_path));
+            open_engine(engine);
+            engine.close();
+            std::cout << "closed ✓ (wal synced)\n";
             return 0;
+        }
+
+        if (cmd == "wal-verify") {
+            const lsm::Config cfg = lsm::Config::load(config_path);
+            const auto report = lsm::Wal::verify(fs::path(cfg.data_dir) / "wal");
+            report.print(std::cout);
+            return 0;
+        }
+
+        if (cmd == "wal-truncate") {
+            return run_wal_truncate(flags, config_path);
         }
 
         if (cmd == "-h" || cmd == "--help" || cmd == "help") {
@@ -147,7 +217,7 @@ int main(int argc, char** argv) {
 
     } catch (const lsm::Error& e) {
         std::cerr << '[' << lsm::to_string(e.code()) << "] " << e.what() << '\n';
-        return 1;
+        return e.code() == lsm::ErrorCode::InvalidArgument ? 2 : 1;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';
         return 1;
