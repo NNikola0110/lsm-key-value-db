@@ -97,7 +97,8 @@ struct SegmentScan {
 
 // Scan one segment record by record. Any decode/checksum failure is treated
 // as tail corruption (Section 1.10): stop at the previous good offset.
-SegmentScan scan_segment(const fs::path& path, const Wal::ReplayFn& replay) {
+SegmentScan scan_segment(const fs::path& path, std::uint64_t segment_id,
+                         const Wal::ReplayFn& replay) {
     SegmentScan result;
 
     std::FILE* f = std::fopen(path.string().c_str(), "rb");
@@ -159,7 +160,7 @@ SegmentScan scan_segment(const fs::path& path, const Wal::ReplayFn& replay) {
             replay(type == kTypeDel,
                    std::string_view(body, key_len),
                    std::string_view(body + key_len, val_len),
-                   seqno);
+                   seqno, segment_id);
         }
     }
 
@@ -167,10 +168,12 @@ SegmentScan scan_segment(const fs::path& path, const Wal::ReplayFn& replay) {
     return result;
 }
 
-WalRecoveryReport scan_all(const fs::path& dir, bool truncate, const Wal::ReplayFn& replay) {
+WalRecoveryReport scan_all(const fs::path& dir, bool truncate, const Wal::ReplayFn& replay,
+                           std::map<std::uint64_t, std::uint64_t>* seg_max = nullptr) {
     WalRecoveryReport report;
     for (const auto& [id, path] : list_segments(dir)) {
-        const SegmentScan scan = scan_segment(path, replay);
+        const SegmentScan scan = scan_segment(path, id, replay);
+        if (seg_max) (*seg_max)[id] = scan.max_seqno;
         report.segments += 1;
         report.records += scan.records;
         report.last_seqno = std::max(report.last_seqno, scan.max_seqno);
@@ -237,7 +240,9 @@ WalRecoveryReport Wal::open(const ReplayFn& replay) {
                     "cannot create WAL dir '" + dir_.string() + "': " + ec.message());
     }
 
-    const WalRecoveryReport report = scan_all(dir_, /*truncate=*/true, replay);
+    // The scan also records each segment's highest seqNo for watermark cleanup.
+    const WalRecoveryReport report = scan_all(dir_, /*truncate=*/true, replay,
+                                              &segment_max_seqno_);
     last_seqno_ = report.last_seqno;
     total_segments_ = report.segments;
 
@@ -337,7 +342,36 @@ std::uint64_t Wal::append(std::uint8_t type, std::string_view key, std::string_v
     }
 
     last_seqno_ = seqno;
+    segment_max_seqno_[active_id_] = seqno;
     return seqno;
+}
+
+std::uint64_t Wal::roll() {
+    if (!file_) {
+        throw Error(ErrorCode::StoreClosed, "WAL is not open");
+    }
+    roll_segment();
+    return active_id_;
+}
+
+std::vector<std::string> Wal::remove_segments_covered(std::uint64_t watermark) {
+    std::vector<std::string> deleted;
+    for (const auto& [id, path] : list_segments(dir_)) {
+        if (id == active_id_) continue;
+        const auto it = segment_max_seqno_.find(id);
+        // Unknown segments are left alone; empty ones (max_seqno 0) hold no
+        // records and are always safe to drop.
+        if (it == segment_max_seqno_.end() || it->second > watermark) continue;
+        std::error_code ec;
+        fs::remove(path, ec);
+        if (ec) {
+            throw Error(ErrorCode::IOFailure,
+                        "cannot delete WAL segment " + path.string() + ": " + ec.message());
+        }
+        segment_max_seqno_.erase(id);
+        deleted.push_back(path.filename().string());
+    }
+    return deleted;
 }
 
 void Wal::sync() {

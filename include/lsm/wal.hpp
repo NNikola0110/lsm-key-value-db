@@ -4,8 +4,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace lsm {
 
@@ -52,9 +54,12 @@ public:
     Wal& operator=(const Wal&) = delete;
 
     // Called once per valid record during replay, oldest record first.
-    // is_del=true for DEL records (value is then empty).
+    // is_del=true for DEL records (value is then empty). segment_id is the
+    // WAL segment the record was read from (used for the flush/cleanup
+    // policy, Section 3.8).
     using ReplayFn = std::function<void(bool is_del, std::string_view key,
-                                        std::string_view value, std::uint64_t seqno)>;
+                                        std::string_view value, std::uint64_t seqno,
+                                        std::uint64_t segment_id)>;
 
     // Creates the directory if needed, scans segments oldest->newest,
     // truncates corrupt tails, seeds the seqNo counter from the highest seqNo
@@ -69,6 +74,20 @@ public:
 
     void sync();
     void close();  // finish appends, sync, close the active segment
+
+    // Close the active segment and start a fresh one; returns the new
+    // segment id. Called on memtable rotation (hybrid WAL-cleanup policy).
+    std::uint64_t roll();
+
+    // Watermark cleanup (Section 3.8): delete every non-active segment whose
+    // highest seqNo is <= watermark (i.e. fully covered by flushed SSTables;
+    // tables are strictly seqNo-ordered, so anything unflushed is above the
+    // watermark). Returns the deleted file names.
+    std::vector<std::string> remove_segments_covered(std::uint64_t watermark);
+
+    // Raise the seqNo counter to at least `floor` (used after loading the
+    // manifest: flushed data may have higher seqNos than the surviving WAL).
+    void bump_seqno(std::uint64_t floor) noexcept { last_seqno_ = std::max(last_seqno_, floor); }
 
     [[nodiscard]] WalStats stats() const;
     [[nodiscard]] bool is_open() const noexcept { return file_ != nullptr; }
@@ -87,6 +106,7 @@ private:
     std::uint64_t roll_bytes_;
 
     std::FILE*    file_ = nullptr;
+    std::map<std::uint64_t, std::uint64_t> segment_max_seqno_;  // per closed+active segment
     std::uint64_t active_id_ = 0;
     std::uint64_t active_bytes_ = 0;
     std::uint64_t total_segments_ = 0;

@@ -14,6 +14,8 @@ match this document; if they disagree, this document wins.
 ## Get(key)
 
 - Returns the latest visible value for `key`.
+- Search order (Section 4): active memtable → immutable memtables
+  (newest→oldest) → SSTables (newest→oldest); the first hit wins.
 - If the latest record for the key is a tombstone (from `Delete`), the key is
   treated as **not found**.
 - An empty key is illegal (`InvalidArgument`).

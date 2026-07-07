@@ -3,10 +3,12 @@
 A single-node LSM (Log-Structured Merge) key-value store — Phase A.
 Language: **C++23**. Build: **CMake**.
 
-Progress: **Section 2 (Memtable)** is implemented. `put`/`del` append durably
-to the write-ahead log, then update an ordered in-memory memtable; `get` reads
-from memory (active → immutables, newest→oldest, tombstones honored). Reads
-from disk arrive with Sections 3–4 (SSTables).
+Progress: **Section 5 (Manifest & Versioning)** is implemented. On top of the
+full read/write path (WAL → memtable → SSTables with Bloom/index/cache reads),
+every change to the table set now goes through an atomic **Version publish**:
+the manifest carries a monotonic `epoch`, readers grab an immutable `Version`
+snapshot per lookup, and rotation/flush swap in a fresh Version with a single
+pointer assignment. Next up: compaction (6).
 
 ## Build
 
@@ -26,9 +28,18 @@ The executable is produced at `build/lsmkv` (or `build/Debug/lsmkv.exe` with MSV
 build/lsmkv init                       # create data/ + data/wal/, print resolved config
 build/lsmkv put --key foo --value bar  # WAL append + memtable; prints: ok seqno=N memtable_bytes=B
 build/lsmkv del --key foo              # WAL append + tombstone; prints: ok seqno=N memtable_bytes=B
-build/lsmkv get --key foo              # prints the value, or NOT FOUND
+build/lsmkv get --key foo              # memtables then SSTables; value or NOT FOUND
+build/lsmkv get --key foo --log-level debug   # adds a per-lookup trace line
+build/lsmkv probe --key foo --repeat 1000     # hot-key loop: shows cache hits
+build/lsmkv probe --absent 1000               # absent keys: shows bloom skips
+build/lsmkv sst-info --file 000001.sst        # footer, index, blocks, bloom details
+build/lsmkv manifest-info                     # epoch + live table listing (newest first)
+build/lsmkv version-info                      # current Version: id/epoch, immutables, SSTs
 build/lsmkv stats                      # config + WAL stats + memtable stats
 build/lsmkv close                      # finish appends, sync, exit cleanly
+build/lsmkv flush-now                  # flush pending immutables to data/sst/
+build/lsmkv list-sst                   # live SSTables: id, size, key/seqno ranges, bloom
+build/lsmkv verify-sst --file 000001.sst   # footer magic + all block checksums
 build/lsmkv wal-verify                 # read-only scan, prints a recovery report
 build/lsmkv wal-truncate --segment 000003.wal --offset 987654   # manual repair tool
 ```
@@ -83,14 +94,82 @@ Missing `--key` exits with a non-zero code.
   one-shot CLI is single-threaded, so no locks exist yet (Section 7 adds
   scheduling).
 
+## SSTable & flush policies (Section 3)
+
+- **File format** (documented in [sstable.hpp](include/lsm/sstable.hpp)):
+  data blocks (~`block_size`, restart point every `restart_interval` entries,
+  per-block CRC32) → sparse index block → Bloom filter block → 40-byte footer
+  with offsets, version, and magic `LSST`. No delta encoding — full keys are
+  stored; restart points enable in-block binary search later.
+- **Flush** keeps only the latest version per key and **keeps tombstones**
+  (compaction, Section 6, decides when to drop them). Files are written as
+  `.sst.tmp`, fsynced, then atomically renamed; the manifest
+  (`data/manifest.json`) is rewritten via the same tmp+fsync+rename dance.
+  Leftover `.tmp` files are deleted on startup; a manifest entry whose file
+  is missing halts with `CorruptionDetected`.
+- **WAL cleanup — watermark policy (3.8):** the manifest's highest flushed
+  seqNo is the persisted watermark; any non-active WAL segment whose max
+  seqNo ≤ watermark is fully covered by SSTables and is deleted after a
+  flush. Memtables are strictly seqNo-ordered, which makes this exact. A live
+  rotation also rolls the WAL segment so frozen data stops sharing a segment
+  with new writes, keeping cleanup prompt.
+- **seqNo continuity:** after cleanup the WAL may hold no records, so the
+  seqNo counter is seeded from max(WAL replay, manifest watermark) — it never
+  runs backwards.
+- **Compression:** `snappy`/`lz4` are accepted in config but not linked into
+  this build; the writer warns and writes uncompressed.
+
+## Versioning (Section 5)
+
+- **Manifest** (`data/manifest.json`, override with `manifest_path`): the
+  durable source of truth. Carries `manifest_version`, a monotonic `epoch`
+  (+1 per change), `next_sst_id`, and the table list **newest→oldest** — the
+  same order the read path needs. Updates stay atomic (tmp+fsync+rename);
+  a leftover `manifest.json.tmp` is ignored and removed on startup.
+- **Version** (in memory): an immutable snapshot of {active memtable,
+  immutables newest→oldest, SSTable handles newest→oldest, epoch, id}.
+  Rotation and flush build a new Version and publish it with one pointer
+  swap; `get` grabs the current Version once and reads only through it.
+  `shared_ptr` refcounts keep an old Version (and every table it references)
+  alive until its last reader lets go — that is the refcount rule from 5.5.
+  (The CLI is single-threaded today, so the swap is trivially atomic; the
+  discipline is what Section 7's background threads will rely on.)
+- **Startup (5.6):** load manifest → open+validate table handles → replay WAL
+  into the memtable → publish the first Version. Printed as
+  `startup: manifest_tables=N epoch=E wal_records=R version_published=V`
+  (version id = epoch + 1 at startup). Orphan `.sst` files not in the
+  manifest are ignored, never half-visible. A corrupt manifest fails fast
+  with `CorruptionDetected` naming the file.
+- Set `publish_log_level=debug` (or `LSMKV_PUBLISH_LOG_LEVEL=debug`) to log
+  a one-liner for every publish.
+
+## Read path (Section 4)
+
+- **Lookup order:** active memtable → immutables (newest→oldest) → SSTables
+  (newest→oldest). First hit wins; a tombstone means NOT FOUND and stops the
+  search. Per table: range check (manifest min/max key) → Bloom check →
+  index binary search → one data-block read → restart-point search in-block.
+- **Block cache:** LRU over checksum-verified data blocks, capacity
+  `block_cache_mb` (64 MiB default). Index blocks are pinned per table when
+  `cache_index_blocks=true`; Bloom filters are always pinned once loaded.
+- **FD budget:** at most `max_open_files` SSTables keep an open handle; the
+  least-recently-used reader is closed when the budget is exceeded.
+- **Corruption:** a failed block checksum or bad footer raises
+  `CorruptionDetected` naming the file and offset; the request fails, the
+  process does not crash.
+- **Stats/tracing:** `stats` prints `read.*` counters (bloom checks/negatives,
+  cache hits/misses, disk reads); `get --log-level debug` prints a per-lookup
+  trace. Counters are per-process (the CLI is one-shot), so use `probe` to
+  observe cache/bloom behavior over many lookups in one process.
+
 ## Layout
 
 ```
-config/default.json   default tunables (see Section 0.4 / 1.6)
-data/                 runtime files (data/wal/ holds WAL segments)
+config/default.json   default tunables (see Sections 0.4 / 1.6 / 2.10 / 3.10)
+data/                 runtime files: wal/ segments, sst/ tables, manifest.json
 docs/                 design notes
 include/lsm/          engine headers + api.md, errors.md
-src/                  CLI + engine sources (wal.cpp is the Section 1 core)
+src/                  CLI + engine sources (wal, memtable, sstable, manifest)
 tests/                test placeholders (Section 9)
 ```
 
@@ -98,9 +177,12 @@ tests/                test placeholders (Section 9)
 
 Keys: `data_dir`, `memtable_max_bytes`, `max_immutable_tables`,
 `memtable_size_overhead_bytes_per_entry`, `block_size`, `bloom_false_positive`,
-`wal_fsync_every_n`, `wal_segment_roll_bytes`, `compression` (`off|snappy|lz4`),
-`log_level` (`debug|info|warn|error`).
+`sst_dir` (empty = `<data_dir>/sst`), `restart_interval`,
+`max_build_buffer_mb`, `block_cache_mb`, `cache_index_blocks`,
+`max_open_files`, `wal_fsync_every_n`, `wal_segment_roll_bytes`,
+`compression` (`off|snappy|lz4`), `log_level` (`debug|info|warn|error`),
+`manifest_path` (empty = `<data_dir>/manifest.json`), `publish_log_level`.
 
 Resolution priority (later wins): built-in defaults → config file →
-env vars (`LSMKV_*`) → CLI flags. A missing config file falls back to defaults;
-unknown keys print a warning and are ignored.
+env vars (`LSMKV_*`) → CLI flags (currently `--log-level`). A missing config
+file falls back to defaults; unknown keys print a warning and are ignored.
