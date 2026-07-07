@@ -3,13 +3,12 @@
 A single-node LSM (Log-Structured Merge) key-value store — Phase A.
 Language: **C++23**. Build: **CMake**.
 
-Progress: **Section 7 (concurrency & scheduling)** is implemented. The engine
-is now multi-threaded: a mutex-serialized writer, lock-free readers (atomic
-Version snapshots), a background **FlushWorker** and **CompactionWorker**,
-blocking write backpressure, and graceful/fast shutdown. Long-running modes:
-`lsmkv repl` (interactive) and `lsmkv stress` (concurrent hammer test).
-One-shot commands keep workers off and stay deterministic.
-Next up: observability & tooling (8).
+Progress: **Section 8 (observability & tooling)** is implemented. The engine
+explains itself: structured `key=value` log events with locked field names,
+Prometheus metrics, a 10-line human `stats` (plus `--json`/`--full`),
+HTTP endpoints via `lsmkv serve` (/healthz /readyz /metrics /stats), and
+`lsmkv doctor` support bundles. See [docs/observability.md](docs/observability.md)
+for the full charter. Next up: testing & fault injection (9).
 
 ## Build
 
@@ -46,6 +45,15 @@ build/lsmkv stress --threads 4 --ops 3000 --read-pct 40   # concurrent load test
 build/lsmkv bg-status                         # worker states, queues, job totals
 build/lsmkv shutdown            # graceful: drain flushes, finish compaction
 build/lsmkv shutdown --fast     # cancel compaction, leave immutables to the WAL
+build/lsmkv stats               # human 10-line summary (--json / --full available)
+build/lsmkv serve               # repl + HTTP: /healthz /readyz /metrics /stats
+build/lsmkv doctor              # writes lsmkv-support-YYYYMMDD-HHMM.zip
+```
+
+Logs are structured `key=value` events on stderr (stdout stays parseable):
+
+```
+ts=2026-07-06T09:07:06Z level=info event=flush_publish imm_id=1 sst_id=000001.sst entries=3 bytes=229 dur_ms=10
 build/lsmkv stats                      # config + WAL stats + memtable stats
 build/lsmkv close                      # finish appends, sync, exit cleanly
 build/lsmkv flush-now                  # flush pending immutables to data/sst/
@@ -265,7 +273,9 @@ spread in a picked set), `tombstone_grace_seconds` (86400),
 `compaction_io_mb_per_s` (0 = unthrottled), `l0_compaction_trigger` (8,
 auto-compact threshold), `l0_stop_writes` (20, write-stall threshold),
 `bg_tick_ms` (500, worker wake-up period), `shutdown_timeout_ms` (5000,
-fast-shutdown grace period).
+fast-shutdown grace period), `metrics_enabled` (true), `http_listen_addr`
+(127.0.0.1:9090), `stats_sampling_interval_ms` (1000, reserved),
+`doctor_bundle_max_mb` (10).
 
 Resolution priority (later wins): built-in defaults → config file →
 env vars (`LSMKV_*`) → CLI flags (currently `--log-level`). A missing config

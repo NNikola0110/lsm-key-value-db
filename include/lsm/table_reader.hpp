@@ -18,9 +18,12 @@
 
 namespace lsm {
 
-// Process-wide read-path counters (Section 4.7 stats). Atomic: many readers
-// bump these concurrently (Section 7).
+// Process-wide read-path counters (Sections 4.7 / 8.2). Atomic: many
+// readers bump these concurrently (Section 7).
 struct ReadStats {
+    std::atomic<std::uint64_t> reads_total{0};            // lsm_reads_total
+    std::atomic<std::uint64_t> hit_memtable_total{0};     // served from active/immutables
+    std::atomic<std::uint64_t> sstables_consulted_total{0};
     std::atomic<std::uint64_t> blooms_checked{0};
     std::atomic<std::uint64_t> blooms_negative{0};  // tables skipped thanks to the Bloom
     std::atomic<std::uint64_t> cache_hits{0};

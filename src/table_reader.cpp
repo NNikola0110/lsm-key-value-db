@@ -1,6 +1,7 @@
 #include "lsm/table_reader.hpp"
 
 #include "lsm/errors.hpp"
+#include "lsm/logging.hpp"
 
 #include <algorithm>
 #include <array>
@@ -59,6 +60,12 @@ std::uint64_t fnv1a(std::string_view s, std::uint64_t seed) {
 }
 
 [[noreturn]] void corrupt(const fs::path& path, std::uint64_t offset, const std::string& what) {
+    log_event(LogLevel::Error, "corruption_detected",
+              {{"file", path.filename().string()},
+               {"offset", std::to_string(offset)},
+               {"phase", "read"},
+               {"action", "fatal"}});
+    count_error(ErrorCode::CorruptionDetected);
     throw Error(ErrorCode::CorruptionDetected,
                 path.filename().string() + " @" + std::to_string(offset) + ": " + what);
 }

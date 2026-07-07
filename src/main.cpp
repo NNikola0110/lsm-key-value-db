@@ -5,14 +5,23 @@
 #include "lsm/compaction.hpp"
 #include "lsm/config.hpp"
 #include "lsm/engine.hpp"
+#include "lsm/http_server.hpp"
+#include "lsm/logging.hpp"
+
+#include <nlohmann/json.hpp>
 #include "lsm/errors.hpp"
 #include "lsm/sstable.hpp"
 #include "lsm/wal.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -36,7 +45,7 @@ void print_usage(std::ostream& os) {
           "  probe --absent N           N gets of random absent keys (bloom demo)\n"
           "  sst-info --file F          footer, index, bloom and block-size details\n"
           "  del   --key K              WAL append + memtable tombstone\n"
-          "  stats                      print config, WAL/memtable/SSTable/version stats\n"
+          "  stats [--json|--full]      human 10-line summary; JSON or full detail\n"
           "  manifest-info              manifest epoch and live table listing\n"
           "  version-info               current Version: epoch/id, immutables, SSTables\n"
           "  close                      finish appends, sync, exit cleanly\n"
@@ -48,6 +57,8 @@ void print_usage(std::ostream& os) {
           "  compaction-pause           stop picker/auto compactions (flag file)\n"
           "  compaction-resume          allow compactions again\n"
           "  repl                       interactive session with background workers\n"
+          "  serve [--addr H:P]         repl + HTTP endpoints (/healthz /readyz /metrics /stats)\n"
+          "  doctor [--bundle PATH]     collect a support bundle (config, manifest, stats...)\n"
           "  stress --threads N --ops M [--read-pct P]   concurrent hammer test\n"
           "  bg-status                  worker states, queues, job totals\n"
           "  shutdown [--fast]          exercise graceful (default) or fast shutdown\n"
@@ -134,8 +145,9 @@ std::string require_flag(const std::unordered_map<std::string, std::string>& fla
 
 // Open the engine (replays the WAL into the memtable) and print the
 // recovery reports (Sections 1.8 and 2.7).
-void open_engine(lsm::Engine& engine) {
+void open_engine(lsm::Engine& engine, bool quiet = false) {
     const lsm::EngineRecovery r = engine.open();
+    if (quiet) return;   // machine-readable modes want pure payload on stdout
     r.wal.print(std::cout);
     std::cout << "recovery: memtable_keys=" << r.memtable_keys
               << " memtable_bytes=" << r.memtable_bytes
@@ -220,33 +232,127 @@ int run_probe(const std::unordered_map<std::string, std::string>& flags,
     return 0;
 }
 
-int run_stats(const lsm::Config& cfg) {
-    lsm::Engine engine(cfg);
-    open_engine(engine);
-
-    engine.config().print(std::cout);
-    const lsm::WalStats s = engine.wal_stats();
-    std::cout << "wal.active_segment="       << s.active_segment_id << '\n'
-              << "wal.active_segment_bytes=" << s.active_segment_bytes << '\n'
-              << "wal.total_segments="       << s.total_segments << '\n'
-              << "wal.last_seqno="           << s.last_seqno << '\n'
-              << "wal.fsync_every_n="        << s.fsync_every_n << '\n'
-              << "wal.segment_roll_bytes="   << s.roll_bytes << '\n';
+nlohmann::json stats_json(lsm::Engine& engine, const lsm::Config& cfg) {
+    const lsm::WalStats w = engine.wal_stats();
     const lsm::MemtableStats m = engine.memtable_stats();
-    std::cout << "memtable.active_entries="         << m.active_entries << '\n'
-              << "memtable.active_bytes="           << m.active_bytes << '\n'
-              << "memtable.immutables_count="       << m.immutables_count << '\n'
-              << "memtable.immutables_bytes_total=" << m.immutables_bytes_total << '\n'
-              << "memtable.flush_requested="        << m.flush_requested << '\n';
     const lsm::SstStats t = engine.sst_stats();
-    std::cout << "sst.count="       << t.sst_count << '\n'
-              << "sst.total_bytes=" << t.sst_total_bytes << '\n'
-              << "sst.newest_id="   << t.newest_id << '\n';
-    print_read_stats(engine);
-    const auto version = engine.current_version();
-    std::cout << "version.epoch="  << version->epoch << '\n'
-              << "version.id="     << version->id << '\n'
-              << "engine status: full single-process read/write path (compaction pending)\n";
+    const lsm::ReadStats& r = engine.read_stats();
+    const lsm::BgStats& b = engine.bg_stats();
+    const auto v = engine.current_version();
+    const auto pick = lsm::pick_compaction(engine.manifest().tables(), cfg);
+    const std::uint64_t lookups = r.cache_hits + r.cache_misses;
+    return {
+        {"epoch", v->epoch},
+        {"version_id", v->id},
+        {"last_seqno", w.last_seqno},
+        {"active_bytes", m.active_bytes},
+        {"active_entries", m.active_entries},
+        {"immutables", m.immutables_count},
+        {"immutables_bytes", m.immutables_bytes_total},
+        {"sst_live", t.sst_count},
+        {"sst_total_bytes", t.sst_total_bytes},
+        {"block_cache_hit_rate",
+         lookups ? static_cast<double>(r.cache_hits) / lookups : 0.0},
+        {"disk_block_reads", r.disk_block_reads.load()},
+        {"blooms_checked", r.blooms_checked.load()},
+        {"blooms_negative", r.blooms_negative.load()},
+        {"compaction_backlog_bytes", pick ? pick->total_bytes : 0},
+        {"jobs_running", (b.flush_running ? 1 : 0) + (b.compact_running ? 1 : 0)},
+        {"wal_segments", w.total_segments},
+        {"wal_active_segment_bytes", w.active_segment_bytes},
+    };
+}
+
+// Prometheus text format (Section 8.2 metric names — locked, never rename).
+std::string prometheus_text(lsm::Engine& engine, const lsm::Config& cfg) {
+    const lsm::WalStats w = engine.wal_stats();
+    const lsm::MemtableStats m = engine.memtable_stats();
+    const lsm::SstStats t = engine.sst_stats();
+    const lsm::ReadStats& r = engine.read_stats();
+    const lsm::BgStats& b = engine.bg_stats();
+    const auto pick = lsm::pick_compaction(engine.manifest().tables(), cfg);
+
+    std::ostringstream os;
+    auto emit = [&](const char* name, const char* type, std::uint64_t value) {
+        os << "# TYPE " << name << ' ' << type << '\n' << name << ' ' << value << '\n';
+    };
+    emit("lsm_writes_total", "counter", b.writes_total);
+    emit("lsm_wal_appends_total", "counter", b.writes_total);
+    emit("lsm_wal_active_segment_bytes", "gauge", w.active_segment_bytes);
+    emit("lsm_wal_segments_total", "gauge", w.total_segments);
+    emit("lsm_memtable_active_bytes", "gauge", m.active_bytes);
+    emit("lsm_memtable_active_entries", "gauge", m.active_entries);
+    emit("lsm_memtables_immutable", "gauge", m.immutables_count);
+    emit("lsm_flush_jobs_total", "counter", b.flush_jobs_total);
+    emit("lsm_sst_created_total", "counter", b.flush_jobs_total);
+    emit("lsm_sst_bytes_written_total", "counter", b.sst_bytes_written_total);
+    emit("lsm_reads_total", "counter", r.reads_total);
+    emit("lsm_read_hit_memtable_total", "counter", r.hit_memtable_total);
+    emit("lsm_read_sstable_consulted_total", "counter", r.sstables_consulted_total);
+    emit("lsm_bloom_checks_total", "counter", r.blooms_checked);
+    emit("lsm_bloom_negative_total", "counter", r.blooms_negative);
+    emit("lsm_block_cache_hits_total", "counter", r.cache_hits);
+    emit("lsm_block_cache_misses_total", "counter", r.cache_misses);
+    emit("lsm_disk_block_reads_total", "counter", r.disk_block_reads);
+    emit("lsm_compaction_jobs_total", "counter", b.compactions_total);
+    emit("lsm_compaction_bytes_in_total", "counter", b.compaction_bytes_in_total);
+    emit("lsm_compaction_bytes_out_total", "counter", b.compaction_bytes_out_total);
+    emit("lsm_compaction_backlog_bytes", "gauge", pick ? pick->total_bytes : 0);
+    emit("lsm_versions_published_total", "counter", b.versions_published_total);
+    emit("lsm_epoch_current", "gauge", engine.current_version()->epoch);
+    emit("lsm_sst_live_total", "gauge", t.sst_count);
+    emit("lsm_write_stalls_total", "counter", b.write_stalls_total);
+    os << "# TYPE lsm_errors_total counter\n";
+    for (auto code : {lsm::ErrorCode::InvalidArgument, lsm::ErrorCode::StoreClosed,
+                      lsm::ErrorCode::IOFailure, lsm::ErrorCode::CorruptionDetected,
+                      lsm::ErrorCode::NotImplemented, lsm::ErrorCode::Backpressure}) {
+        os << "lsm_errors_total{type=\"" << lsm::to_string(code) << "\"} "
+           << lsm::error_count(code) << '\n';
+    }
+    return os.str();
+}
+
+void print_stats_human(lsm::Engine& engine, const lsm::Config& cfg) {
+    const nlohmann::json j = stats_json(engine, cfg);
+    std::cout << "epoch=" << j["epoch"] << " version_id=" << j["version_id"]
+              << " last_seqno=" << j["last_seqno"] << '\n'
+              << "active_bytes=" << j["active_bytes"]
+              << " active_entries=" << j["active_entries"] << '\n'
+              << "immutables=" << j["immutables"]
+              << " immutables_bytes=" << j["immutables_bytes"] << '\n'
+              << "sst_live=" << j["sst_live"]
+              << " sst_total_bytes=" << j["sst_total_bytes"] << '\n'
+              << "block_cache_hit_rate=" << j["block_cache_hit_rate"]
+              << " disk_block_reads=" << j["disk_block_reads"] << '\n'
+              << "blooms_checked=" << j["blooms_checked"]
+              << " blooms_negative=" << j["blooms_negative"] << '\n'
+              << "compaction_backlog_bytes=" << j["compaction_backlog_bytes"]
+              << " jobs_running=" << j["jobs_running"] << '\n'
+              << "wal_segments=" << j["wal_segments"]
+              << " wal_active_segment_bytes=" << j["wal_active_segment_bytes"] << '\n';
+}
+
+int run_stats(const std::unordered_map<std::string, std::string>& flags,
+              const lsm::Config& cfg) {
+    lsm::Engine engine(cfg);
+    open_engine(engine, /*quiet=*/flags.contains("json"));
+
+    if (flags.contains("json")) {
+        std::cout << stats_json(engine, cfg).dump(2) << '\n';
+    } else if (flags.contains("full")) {
+        engine.config().print(std::cout);
+        const lsm::WalStats s = engine.wal_stats();
+        std::cout << "wal.active_segment=" << s.active_segment_id << '\n'
+                  << "wal.fsync_every_n=" << s.fsync_every_n << '\n'
+                  << "wal.segment_roll_bytes=" << s.roll_bytes << '\n';
+        const lsm::MemtableStats m = engine.memtable_stats();
+        std::cout << "memtable.flush_requested=" << m.flush_requested << '\n'
+                  << "sst.newest_id=" << engine.sst_stats().newest_id << '\n';
+        print_read_stats(engine);
+        print_stats_human(engine, cfg);
+    } else {
+        print_stats_human(engine, cfg);
+    }
     engine.close();
     return 0;
 }
@@ -302,10 +408,46 @@ void print_bg_status(lsm::Engine& engine, const lsm::Config& cfg) {
     }
 }
 
-int run_repl(const lsm::Config& cfg) {
+int run_repl(const lsm::Config& cfg, bool with_http) {
     lsm::Engine engine(cfg);
     open_engine(engine);
     engine.start_background();
+
+    std::unique_ptr<lsm::HttpServer> http;
+    if (with_http) {
+        // 8.5 endpoints. /readyz is 503 until WAL/manifest/workers are up —
+        // by this point they are, so readiness mirrors background_running().
+        http = std::make_unique<lsm::HttpServer>(
+            cfg.http_listen_addr, [&engine, &cfg](const std::string& path) {
+                lsm::HttpResponse resp;
+                if (path == "/healthz") {
+                    resp.body = "ok";
+                } else if (path == "/readyz") {
+                    if (engine.background_running() && !engine.closed()) {
+                        resp.body = "ready";
+                    } else {
+                        resp.status = 503;
+                        resp.body = "not ready";
+                    }
+                } else if (path == "/metrics") {
+                    if (!cfg.metrics_enabled) {
+                        resp.status = 404;
+                        resp.body = "metrics disabled";
+                    } else {
+                        resp.body = prometheus_text(engine, cfg);
+                    }
+                } else if (path == "/stats") {
+                    resp.content_type = "application/json";
+                    resp.body = stats_json(engine, cfg).dump(2);
+                } else {
+                    resp.status = 404;
+                    resp.body = "not found (try /healthz /readyz /metrics /stats)";
+                }
+                return resp;
+            });
+        std::cout << "http listening on " << cfg.http_listen_addr
+                  << " (/healthz /readyz /metrics /stats)\n";
+    }
     std::cout << "repl ready (put K V | get K | del K | stats | bg-status | flush | compact"
                  " | pause | resume | quit [--fast])\n";
 
@@ -342,12 +484,110 @@ int run_repl(const lsm::Config& cfg) {
             else if (cmd == "resume")  engine.set_compaction_paused(false);
             else std::cout << "unknown repl command: " << cmd << '\n';
         } catch (const lsm::Error& e) {
+            lsm::count_error(e.code());
             std::cout << '[' << lsm::to_string(e.code()) << "] " << e.what() << '\n';
         }
     }
     std::cout << (graceful ? "shutting down (graceful)...\n" : "shutting down (fast)...\n");
+    if (http) http->stop();
     engine.close(graceful);
     std::cout << "closed ✓\n";
+    return 0;
+}
+
+// Support bundle (Section 8.6): small text snapshots, never the big files.
+int run_doctor(const std::unordered_map<std::string, std::string>& flags,
+               const lsm::Config& cfg) {
+    lsm::Engine engine(cfg);
+    open_engine(engine);
+
+    std::string ts = lsm::ts_rfc3339();   // 2026-07-06T12:34:56Z -> 20260706-1234
+    std::string stamp;
+    for (char c : ts) if (std::isdigit(static_cast<unsigned char>(c))) stamp += c;
+    stamp = stamp.substr(0, 8) + "-" + stamp.substr(8, 4);
+    const std::string bundle_name = "lsmkv-support-" + stamp;
+    fs::path zip_path = flags.contains("bundle") && !flags.at("bundle").empty()
+                            ? fs::path(flags.at("bundle"))
+                            : fs::path(bundle_name + ".zip");
+    const fs::path dir = zip_path.parent_path() / bundle_name;
+    fs::create_directories(dir);
+
+    auto write_file = [&](const std::string& name, const std::string& content) {
+        std::ofstream out(dir / name, std::ios::binary);
+        out << content;
+    };
+
+    { std::ostringstream os; engine.config().print(os); write_file("config_active.txt", os.str()); }
+    std::error_code ec;
+    fs::copy_file(cfg.resolved_manifest_path(), dir / "manifest.json",
+                  fs::copy_options::overwrite_existing, ec);
+
+    std::ostringstream sst_list, wal_list;
+    for (const auto& e : fs::directory_iterator(cfg.resolved_sst_dir())) {
+        sst_list << e.path().filename().string() << " size=" << fs::file_size(e.path()) << '\n';
+    }
+    write_file("sst_listing.txt", sst_list.str());
+    const fs::path wal_dir = fs::path(cfg.data_dir) / "wal";
+    fs::path newest_wal;
+    for (const auto& e : fs::directory_iterator(wal_dir)) {
+        wal_list << e.path().filename().string() << " size=" << fs::file_size(e.path()) << '\n';
+        if (newest_wal.empty() || e.path().filename() > newest_wal.filename()) newest_wal = e.path();
+    }
+    write_file("wal_listing.txt", wal_list.str());
+    if (!newest_wal.empty()) {   // last 64 KB of the active segment (8.6)
+        std::ifstream in(newest_wal, std::ios::binary);
+        const std::uint64_t size = fs::file_size(newest_wal);
+        const std::uint64_t take = std::min<std::uint64_t>(size, 64 * 1024);
+        in.seekg(static_cast<std::streamoff>(size - take));
+        std::string tail(take, '\0');
+        in.read(tail.data(), static_cast<std::streamsize>(take));
+        write_file("wal_active_tail.bin", tail);
+    }
+
+    { std::ostringstream os;
+      const nlohmann::json j = stats_json(engine, cfg);
+      os << j.dump(2) << '\n';
+      write_file("stats.json", os.str()); }
+    { std::ostringstream os;
+      auto* old = std::cout.rdbuf(os.rdbuf());
+      print_stats_human(engine, cfg);
+      print_bg_status(engine, cfg);
+      std::cout.rdbuf(old);
+      write_file("stats_and_bg_status.txt", os.str()); }
+    write_file("env.txt",
+               "executable=lsmkv (Phase A, Section 8)\nbuilt_standard=C++23\n"
+               "os=" +
+#ifdef _WIN32
+               std::string("windows")
+#else
+               std::string("posix")
+#endif
+               + "\ncaptured_at=" + ts + "\nnote=logs go to stderr; capture with 2>file\n");
+
+    engine.close();
+
+    // Size cap, then best-effort zip; the directory is the fallback deliverable.
+    std::uint64_t total = 0;
+    for (const auto& e : fs::recursive_directory_iterator(dir)) {
+        if (e.is_regular_file()) total += fs::file_size(e.path());
+    }
+    if (total > static_cast<std::uint64_t>(cfg.doctor_bundle_max_mb) * 1024 * 1024) {
+        std::cerr << "warning: bundle exceeds doctor_bundle_max_mb; trimming wal tail\n";
+        fs::remove(dir / "wal_active_tail.bin", ec);
+    }
+#ifdef _WIN32
+    const std::string cmd = "powershell -NoProfile -Command \"Compress-Archive -Force -Path '" +
+                            dir.string() + "\\*' -DestinationPath '" + zip_path.string() + "'\"";
+#else
+    const std::string cmd = "zip -qr '" + zip_path.string() + "' '" + dir.string() + "'";
+#endif
+    if (std::system(cmd.c_str()) == 0 && fs::exists(zip_path)) {
+        fs::remove_all(dir, ec);
+        std::cout << "support bundle written: " << zip_path.string()
+                  << " (" << fs::file_size(zip_path) << " bytes)\n";
+    } else {
+        std::cout << "zip unavailable; bundle left as directory: " << dir.string() << '\n';
+    }
     return 0;
 }
 
@@ -435,7 +675,7 @@ int main(int argc, char** argv) {
         }
 
         if (cmd == "stats") {
-            return run_stats(cfg);
+            return run_stats(flags, cfg);
         }
 
         if (cmd == "close") {
@@ -466,10 +706,28 @@ int main(int argc, char** argv) {
             lsm::Engine engine(cfg);
             open_engine(engine);
             const lsm::Manifest& m = engine.manifest();
+            const fs::path mpath = cfg.resolved_manifest_path();
             std::cout << "manifest: epoch=" << m.epoch()
                       << " tables=" << m.tables().size()
                       << " next_sst_id=" << m.next_id()
-                      << " total_bytes=" << m.total_bytes() << '\n';
+                      << " total_bytes=" << m.total_bytes();
+            std::error_code mec;
+            if (fs::exists(mpath, mec)) {
+                const auto mtime = fs::last_write_time(mpath, mec);
+                const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(mtime);
+                const std::time_t tt = std::chrono::system_clock::to_time_t(sys);
+                std::tm tm{};
+#ifdef _WIN32
+                gmtime_s(&tm, &tt);
+#else
+                gmtime_r(&tt, &tm);
+#endif
+                char buf[32];
+                std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+                std::cout << " json_bytes=" << fs::file_size(mpath, mec)
+                          << " last_modified=" << buf;
+            }
+            std::cout << '\n';
             for (const auto& t : m.tables()) {   // newest first
                 std::cout << "  " << t.file_name << " size=" << t.file_size
                           << " keys=[" << t.min_key << ".." << t.max_key << "]"
@@ -617,8 +875,16 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        if (cmd == "repl") {
-            return run_repl(cfg);
+        if (cmd == "repl" || cmd == "serve") {
+            lsm::Config serve_cfg = cfg;
+            if (auto it = flags.find("addr"); it != flags.end() && !it->second.empty()) {
+                serve_cfg.http_listen_addr = it->second;
+            }
+            return run_repl(serve_cfg, /*with_http=*/cmd == "serve");
+        }
+
+        if (cmd == "doctor") {
+            return run_doctor(flags, cfg);
         }
 
         if (cmd == "stress") {
@@ -663,6 +929,7 @@ int main(int argc, char** argv) {
         return 2;
 
     } catch (const lsm::Error& e) {
+        lsm::count_error(e.code());
         std::cerr << '[' << lsm::to_string(e.code()) << "] " << e.what() << '\n';
         return e.code() == lsm::ErrorCode::InvalidArgument ? 2 : 1;
     } catch (const std::exception& e) {

@@ -64,8 +64,12 @@ struct BgStats {
     std::atomic<bool>          compact_running{false};
     std::atomic<std::uint64_t> flush_jobs_total{0};
     std::atomic<std::uint64_t> flush_last_ms{0};
+    std::atomic<std::uint64_t> sst_bytes_written_total{0};   // by flush (8.2)
     std::atomic<std::uint64_t> compactions_total{0};
     std::atomic<std::uint64_t> compaction_last_ms{0};
+    std::atomic<std::uint64_t> compaction_bytes_in_total{0};
+    std::atomic<std::uint64_t> compaction_bytes_out_total{0};
+    std::atomic<std::uint64_t> writes_total{0};              // accepted put+del
     std::atomic<std::uint64_t> write_stalls_total{0};
     std::atomic<std::uint64_t> stall_time_ms_total{0};
     std::atomic<std::uint64_t> versions_published_total{0};

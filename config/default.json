@@ -23,5 +23,9 @@
   "l0_compaction_trigger": 8,
   "l0_stop_writes": 20,
   "bg_tick_ms": 500,
-  "shutdown_timeout_ms": 5000
+  "shutdown_timeout_ms": 5000,
+  "metrics_enabled": true,
+  "http_listen_addr": "127.0.0.1:9090",
+  "stats_sampling_interval_ms": 1000,
+  "doctor_bundle_max_mb": 10
 }

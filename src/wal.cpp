@@ -1,6 +1,7 @@
 #include "lsm/wal.hpp"
 
 #include "lsm/errors.hpp"
+#include "lsm/logging.hpp"
 
 #include <algorithm>
 #include <array>
@@ -189,6 +190,9 @@ WalRecoveryReport scan_all(const fs::path& dir, bool truncate, const Wal::Replay
                                 "cannot truncate corrupt WAL tail in " + path.string() +
                                     ": " + ec.message());
                 }
+                log_event(LogLevel::Warn, "wal_truncate_tail",
+                          {{"segment", path.filename().string()},
+                           {"truncated_to", std::to_string(scan.good_bytes)}});
             }
         }
     }
