@@ -60,11 +60,12 @@ Manifest Manifest::load_or_create(fs::path path) {
         throw Error(ErrorCode::CorruptionDetected,
                     "invalid manifest JSON in " + m.path_.string() + ": " + e.what());
     }
-    // Normalize to newest-first regardless of stored order (ids are
-    // monotonic, so id order == age order), and be defensive about the
-    // counter even if the stored value lags behind.
+    // Normalize to newest-first BY DATA AGE. After compaction, ids no longer
+    // track age (an output file has a new id but old seqNos), so max_seqno —
+    // unique across tables because ranges stay disjoint — is the order the
+    // read path's first-hit-wins rule needs.
     std::sort(m.tables_.begin(), m.tables_.end(),
-              [](const TableMeta& a, const TableMeta& b) { return a.id > b.id; });
+              [](const TableMeta& a, const TableMeta& b) { return a.max_seqno > b.max_seqno; });
     for (const auto& t : m.tables_) {
         m.next_sst_id_ = std::max(m.next_sst_id_, t.id + 1);
     }
@@ -76,6 +77,21 @@ void Manifest::add_table(const TableMeta& meta) {
     next_sst_id_ = std::max(next_sst_id_, meta.id + 1);
     epoch_ += 1;
     save();
+}
+
+void Manifest::apply_compaction(const std::vector<std::uint64_t>& removed_ids,
+                                const TableMeta* added) {
+    std::erase_if(tables_, [&](const TableMeta& t) {
+        return std::find(removed_ids.begin(), removed_ids.end(), t.id) != removed_ids.end();
+    });
+    if (added) {
+        tables_.push_back(*added);
+        next_sst_id_ = std::max(next_sst_id_, added->id + 1);
+    }
+    std::sort(tables_.begin(), tables_.end(),
+              [](const TableMeta& a, const TableMeta& b) { return a.max_seqno > b.max_seqno; });
+    epoch_ += 1;
+    save();   // one atomic rewrite: old and new sets are never both visible
 }
 
 void Manifest::save() const {

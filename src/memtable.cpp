@@ -1,9 +1,12 @@
 #include "lsm/memtable.hpp"
 
+#include <mutex>
+
 namespace lsm {
 
 void Memtable::apply(std::string_view key, std::string_view value,
                      std::uint64_t seqno, bool tombstone) {
+    std::unique_lock lock(mutex_);
     auto it = map_.find(key);
     if (it != map_.end()) {
         bytes_ -= entry_size(it->first, it->second.value);
@@ -17,9 +20,21 @@ void Memtable::apply(std::string_view key, std::string_view value,
     bytes_ += entry_size(key, value);
 }
 
-const MemEntry* Memtable::find(std::string_view key) const {
+std::optional<MemEntry> Memtable::find(std::string_view key) const {
+    std::shared_lock lock(mutex_);
     auto it = map_.find(key);
-    return it == map_.end() ? nullptr : &it->second;
+    if (it == map_.end()) return std::nullopt;
+    return it->second;
+}
+
+std::uint64_t Memtable::bytes() const {
+    std::shared_lock lock(mutex_);
+    return bytes_;
+}
+
+std::uint64_t Memtable::entries() const {
+    std::shared_lock lock(mutex_);
+    return map_.size();
 }
 
 } // namespace lsm

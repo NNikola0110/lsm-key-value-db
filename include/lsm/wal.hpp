@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,7 +35,9 @@ struct WalStats {
 };
 
 // Append-only write-ahead log split into numbered segments (000001.wal, ...)
-// under one directory. Single writer, no threads yet (Section 7).
+// under one directory. One writer appends; the FlushWorker may concurrently
+// delete covered segments — an internal mutex serializes all file-state
+// mutation, so callers need no external lock (Section 7).
 //
 // Segment layout:  8-byte header [magic "LSMW" | version u8 | 3 reserved bytes],
 // then records. Record framing (all integers little-endian):
@@ -100,7 +103,9 @@ private:
     std::uint64_t append(std::uint8_t type, std::string_view key, std::string_view value);
     void open_active_segment(std::uint64_t id, bool fresh);
     void roll_segment();
+    void close_locked();
 
+    mutable std::mutex mutex_;
     std::filesystem::path dir_;
     std::uint32_t fsync_every_n_;
     std::uint64_t roll_bytes_;

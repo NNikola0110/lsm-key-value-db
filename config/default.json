@@ -14,5 +14,14 @@
   "wal_segment_roll_bytes": 134217728,
   "compression": "off",
   "log_level": "info",
-  "publish_log_level": "info"
+  "publish_log_level": "info",
+  "size_tiered_fan_in": 4,
+  "size_tiered_size_ratio": 2.0,
+  "tombstone_grace_seconds": 86400,
+  "compaction_max_concurrent": 1,
+  "compaction_io_mb_per_s": 0,
+  "l0_compaction_trigger": 8,
+  "l0_stop_writes": 20,
+  "bg_tick_ms": 500,
+  "shutdown_timeout_ms": 5000
 }

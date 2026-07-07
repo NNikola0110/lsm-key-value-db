@@ -97,6 +97,9 @@ Config Config::load(const std::filesystem::path& config_path) {
             "block_cache_mb", "cache_index_blocks", "max_open_files",
             "wal_fsync_every_n", "wal_segment_roll_bytes", "compression", "log_level",
             "manifest_path", "publish_log_level",
+            "size_tiered_fan_in", "size_tiered_size_ratio", "tombstone_grace_seconds",
+            "compaction_max_concurrent", "compaction_io_mb_per_s",
+            "l0_compaction_trigger", "l0_stop_writes", "bg_tick_ms", "shutdown_timeout_ms",
         };
 
         for (auto it = doc.begin(); it != doc.end(); ++it) {
@@ -125,6 +128,15 @@ Config Config::load(const std::filesystem::path& config_path) {
             else if (key == "log_level")           cfg.log_level = log_level_from_string(v.get<std::string>());
             else if (key == "manifest_path")       cfg.manifest_path = v.get<std::string>();
             else if (key == "publish_log_level")   cfg.publish_log_level = log_level_from_string(v.get<std::string>());
+            else if (key == "size_tiered_fan_in")  cfg.size_tiered_fan_in = v.get<std::uint32_t>();
+            else if (key == "size_tiered_size_ratio") cfg.size_tiered_size_ratio = v.get<double>();
+            else if (key == "tombstone_grace_seconds") cfg.tombstone_grace_seconds = v.get<std::uint32_t>();
+            else if (key == "compaction_max_concurrent") cfg.compaction_max_concurrent = v.get<std::uint32_t>();
+            else if (key == "compaction_io_mb_per_s") cfg.compaction_io_mb_per_s = v.get<std::uint32_t>();
+            else if (key == "l0_compaction_trigger") cfg.l0_compaction_trigger = v.get<std::uint32_t>();
+            else if (key == "l0_stop_writes")      cfg.l0_stop_writes = v.get<std::uint32_t>();
+            else if (key == "bg_tick_ms")          cfg.bg_tick_ms = v.get<std::uint32_t>();
+            else if (key == "shutdown_timeout_ms") cfg.shutdown_timeout_ms = v.get<std::uint32_t>();
         }
     }
     // Missing file falls through with defaults; both paths still honor env overrides.
@@ -153,6 +165,15 @@ void Config::apply_env() {
     if (auto v = env("LSMKV_LOG_LEVEL"))            log_level = log_level_from_string(*v);
     if (auto v = env("LSMKV_MANIFEST_PATH"))        manifest_path = *v;
     if (auto v = env("LSMKV_PUBLISH_LOG_LEVEL"))    publish_log_level = log_level_from_string(*v);
+    if (auto v = env("LSMKV_SIZE_TIERED_FAN_IN"))   size_tiered_fan_in = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_SIZE_TIERED_SIZE_RATIO")) size_tiered_size_ratio = std::stod(*v);
+    if (auto v = env("LSMKV_TOMBSTONE_GRACE_SECONDS")) tombstone_grace_seconds = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_COMPACTION_MAX_CONCURRENT")) compaction_max_concurrent = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_COMPACTION_IO_MB_PER_S")) compaction_io_mb_per_s = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_L0_COMPACTION_TRIGGER")) l0_compaction_trigger = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_L0_STOP_WRITES"))       l0_stop_writes = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_BG_TICK_MS"))           bg_tick_ms = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_SHUTDOWN_TIMEOUT_MS"))  shutdown_timeout_ms = static_cast<std::uint32_t>(std::stoul(*v));
 }
 
 void Config::print(std::ostream& os) const {
@@ -173,7 +194,16 @@ void Config::print(std::ostream& os) const {
        << "compression="           << to_string(compression)    << '\n'
        << "log_level="             << to_string(log_level)      << '\n'
        << "manifest_path="         << resolved_manifest_path().string() << '\n'
-       << "publish_log_level="     << to_string(publish_log_level) << '\n';
+       << "publish_log_level="     << to_string(publish_log_level) << '\n'
+       << "size_tiered_fan_in="    << size_tiered_fan_in        << '\n'
+       << "size_tiered_size_ratio=" << size_tiered_size_ratio   << '\n'
+       << "tombstone_grace_seconds=" << tombstone_grace_seconds << '\n'
+       << "compaction_max_concurrent=" << compaction_max_concurrent << '\n'
+       << "compaction_io_mb_per_s=" << compaction_io_mb_per_s   << '\n'
+       << "l0_compaction_trigger=" << l0_compaction_trigger     << '\n'
+       << "l0_stop_writes="        << l0_stop_writes            << '\n'
+       << "bg_tick_ms="            << bg_tick_ms                << '\n'
+       << "shutdown_timeout_ms="   << shutdown_timeout_ms       << '\n';
 }
 
 } // namespace lsm
