@@ -338,6 +338,7 @@ std::uint64_t Wal::append(std::uint8_t type, std::string_view key, std::string_v
         throw Error(ErrorCode::IOFailure, "cannot append WAL record: " + path.string());
     }
     active_bytes_ += rec.size();
+    crash_point("CP_WAL_AFTER_APPEND_BEFORE_FSYNC");
 
     // Only after the record meets the sync policy do we acknowledge success.
     appends_since_sync_ += 1;
@@ -345,6 +346,7 @@ std::uint64_t Wal::append(std::uint8_t type, std::string_view key, std::string_v
         fsync_file(file_, path);
         appends_since_sync_ = 0;
     }
+    crash_point("CP_WAL_AFTER_FSYNC_BEFORE_ACK");
 
     last_seqno_ = seqno;
     segment_max_seqno_[active_id_] = seqno;

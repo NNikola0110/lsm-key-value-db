@@ -1,6 +1,7 @@
 #include "lsm/sstable.hpp"
 
 #include "lsm/errors.hpp"
+#include "lsm/logging.hpp"
 
 #include <array>
 #include <cmath>
@@ -207,6 +208,7 @@ SstBuildResult write_sstable(const fs::path& sst_dir, std::uint64_t id,
             if (block.size() >= cfg.block_size) finish_block();
         }
         finish_block();
+        crash_point("CP_FLUSH_AFTER_DATABLOCKS_BEFORE_INDEX");
         result.min_key = mem.sorted_entries().begin()->first;
 
         // --- index block ---
@@ -248,6 +250,7 @@ SstBuildResult write_sstable(const fs::path& sst_dir, std::uint64_t id,
         fsync_file(f, tmp_path);
         std::fclose(f);
         f = nullptr;
+        crash_point("CP_FLUSH_AFTER_INDEX_BEFORE_RENAME");
 
         std::error_code ec;
         fs::rename(tmp_path, final_path, ec);   // atomic publish

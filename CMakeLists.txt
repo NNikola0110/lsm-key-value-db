@@ -18,9 +18,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
-# --- The lsmkv CLI executable ---
-add_executable(lsmkv
-  src/main.cpp
+# --- Engine core library (shared by the CLI and the tests) ---
+add_library(lsmkv_core STATIC
   src/compaction.cpp
   src/config.cpp
   src/engine.cpp
@@ -32,15 +31,25 @@ add_executable(lsmkv
   src/table_reader.cpp
   src/wal.cpp
 )
-target_include_directories(lsmkv PRIVATE include)
-target_link_libraries(lsmkv PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(lsmkv_core PUBLIC include)
+target_link_libraries(lsmkv_core PUBLIC nlohmann_json::nlohmann_json)
 if(WIN32)
-  target_link_libraries(lsmkv PRIVATE ws2_32)
+  target_link_libraries(lsmkv_core PUBLIC ws2_32)
 endif()
 
-if(MSVC)
-  target_compile_options(lsmkv PRIVATE /W4 /utf-8 /permissive-)
-  target_compile_definitions(lsmkv PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-  target_compile_options(lsmkv PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+# --- The lsmkv CLI executable ---
+add_executable(lsmkv src/main.cpp)
+target_link_libraries(lsmkv PRIVATE lsmkv_core)
+
+# --- Unit + property tests (Section 9) ---
+add_executable(lsmkv_tests tests/unit_tests.cpp)
+target_link_libraries(lsmkv_tests PRIVATE lsmkv_core)
+
+foreach(tgt lsmkv_core lsmkv lsmkv_tests)
+  if(MSVC)
+    target_compile_options(${tgt} PRIVATE /W4 /utf-8 /permissive-)
+    target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)
+  else()
+    target_compile_options(${tgt} PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+endforeach()

@@ -1,6 +1,7 @@
 #include "lsm/manifest.hpp"
 
 #include "lsm/errors.hpp"
+#include "lsm/logging.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -137,6 +138,7 @@ void Manifest::save() const {
         throw Error(ErrorCode::IOFailure, "cannot write temp manifest: " + tmp.string());
     }
 
+    crash_point("CP_MANIFEST_AFTER_WRITE_BEFORE_RENAME");
     std::error_code ec;
     fs::rename(tmp, path_, ec);   // atomic swap over the old manifest
     if (ec) {
