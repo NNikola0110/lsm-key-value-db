@@ -14,6 +14,7 @@ enum class ErrorCode {
     IOFailure,
     CorruptionDetected,
     NotImplemented,
+    Backpressure,   // Section 2.6: write refused, immutable memtables at limit
 };
 
 constexpr std::string_view to_string(ErrorCode code) noexcept {
@@ -23,6 +24,7 @@ constexpr std::string_view to_string(ErrorCode code) noexcept {
         case ErrorCode::IOFailure:          return "IOFailure";
         case ErrorCode::CorruptionDetected: return "CorruptionDetected";
         case ErrorCode::NotImplemented:     return "NotImplemented";
+        case ErrorCode::Backpressure:       return "Backpressure";
     }
     return "Unknown";
 }

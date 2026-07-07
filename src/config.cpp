@@ -81,7 +81,8 @@ Config Config::load(const std::filesystem::path& config_path) {
         }
 
         static const std::set<std::string> known = {
-            "data_dir", "memtable_max_bytes", "block_size", "bloom_false_positive",
+            "data_dir", "memtable_max_bytes", "max_immutable_tables",
+            "memtable_size_overhead_bytes_per_entry", "block_size", "bloom_false_positive",
             "wal_fsync_every_n", "wal_segment_roll_bytes", "compression", "log_level",
         };
 
@@ -94,6 +95,9 @@ Config Config::load(const std::filesystem::path& config_path) {
             const auto& v = it.value();
             if (key == "data_dir")                 cfg.data_dir = v.get<std::string>();
             else if (key == "memtable_max_bytes")  cfg.memtable_max_bytes = v.get<std::uint64_t>();
+            else if (key == "max_immutable_tables") cfg.max_immutable_tables = v.get<std::uint32_t>();
+            else if (key == "memtable_size_overhead_bytes_per_entry")
+                cfg.memtable_size_overhead_bytes_per_entry = v.get<std::uint32_t>();
             else if (key == "block_size")          cfg.block_size = v.get<std::uint32_t>();
             else if (key == "bloom_false_positive") cfg.bloom_false_positive = v.get<double>();
             else if (key == "wal_fsync_every_n")   cfg.wal_fsync_every_n = v.get<std::uint32_t>();
@@ -111,6 +115,9 @@ Config Config::load(const std::filesystem::path& config_path) {
 void Config::apply_env() {
     if (auto v = env("LSMKV_DATA_DIR"))             data_dir = *v;
     if (auto v = env("LSMKV_MEMTABLE_MAX_BYTES"))   memtable_max_bytes = std::stoull(*v);
+    if (auto v = env("LSMKV_MAX_IMMUTABLE_TABLES")) max_immutable_tables = static_cast<std::uint32_t>(std::stoul(*v));
+    if (auto v = env("LSMKV_MEMTABLE_SIZE_OVERHEAD_BYTES_PER_ENTRY"))
+        memtable_size_overhead_bytes_per_entry = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_BLOCK_SIZE"))           block_size = static_cast<std::uint32_t>(std::stoul(*v));
     if (auto v = env("LSMKV_BLOOM_FALSE_POSITIVE")) bloom_false_positive = std::stod(*v);
     if (auto v = env("LSMKV_WAL_FSYNC_EVERY_N"))    wal_fsync_every_n = static_cast<std::uint32_t>(std::stoul(*v));
@@ -122,6 +129,8 @@ void Config::apply_env() {
 void Config::print(std::ostream& os) const {
     os << "data_dir="              << data_dir                  << '\n'
        << "memtable_max_bytes="    << memtable_max_bytes        << '\n'
+       << "max_immutable_tables="  << max_immutable_tables      << '\n'
+       << "memtable_size_overhead_bytes_per_entry=" << memtable_size_overhead_bytes_per_entry << '\n'
        << "block_size="            << block_size                << '\n'
        << "bloom_false_positive="  << bloom_false_positive      << '\n'
        << "wal_fsync_every_n="     << wal_fsync_every_n         << '\n'

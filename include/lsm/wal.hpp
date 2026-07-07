@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -50,10 +51,16 @@ public:
     Wal(const Wal&) = delete;
     Wal& operator=(const Wal&) = delete;
 
+    // Called once per valid record during replay, oldest record first.
+    // is_del=true for DEL records (value is then empty).
+    using ReplayFn = std::function<void(bool is_del, std::string_view key,
+                                        std::string_view value, std::uint64_t seqno)>;
+
     // Creates the directory if needed, scans segments oldest->newest,
     // truncates corrupt tails, seeds the seqNo counter from the highest seqNo
-    // seen, and opens the newest segment for appending.
-    WalRecoveryReport open();
+    // seen, and opens the newest segment for appending. If replay is given it
+    // receives every valid record (used to rebuild the memtable, Section 2.7).
+    WalRecoveryReport open(const ReplayFn& replay = nullptr);
 
     // Append one mutation; returns its assigned seqNo. The record is durable
     // per the sync policy before this returns.

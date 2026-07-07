@@ -3,9 +3,10 @@
 A single-node LSM (Log-Structured Merge) key-value store — Phase A.
 Language: **C++23**. Build: **CMake**.
 
-Progress: **Section 1 (WAL & crash recovery)** is implemented. `put`/`del`
-append durably to the write-ahead log and survive crashes; `get` stays
-`not implemented` until Section 2 (Memtable).
+Progress: **Section 2 (Memtable)** is implemented. `put`/`del` append durably
+to the write-ahead log, then update an ordered in-memory memtable; `get` reads
+from memory (active → immutables, newest→oldest, tombstones honored). Reads
+from disk arrive with Sections 3–4 (SSTables).
 
 ## Build
 
@@ -23,20 +24,21 @@ The executable is produced at `build/lsmkv` (or `build/Debug/lsmkv.exe` with MSV
 
 ```sh
 build/lsmkv init                       # create data/ + data/wal/, print resolved config
-build/lsmkv put --key foo --value bar  # append PUT record, prints assigned seqno
-build/lsmkv del --key foo              # append DEL record, prints assigned seqno
-build/lsmkv get --key foo              # Get(foo) — not implemented yet (Section 2)
-build/lsmkv stats                      # config + WAL stats (segments, last seqno, ...)
+build/lsmkv put --key foo --value bar  # WAL append + memtable; prints: ok seqno=N memtable_bytes=B
+build/lsmkv del --key foo              # WAL append + tombstone; prints: ok seqno=N memtable_bytes=B
+build/lsmkv get --key foo              # prints the value, or NOT FOUND
+build/lsmkv stats                      # config + WAL stats + memtable stats
 build/lsmkv close                      # finish appends, sync, exit cleanly
 build/lsmkv wal-verify                 # read-only scan, prints a recovery report
 build/lsmkv wal-truncate --segment 000003.wal --offset 987654   # manual repair tool
 ```
 
-Every command that opens the engine first replays the WAL and prints a
-one-line recovery report, e.g.:
+Every command that opens the engine first replays the WAL — rebuilding the
+memtable — and prints two recovery lines, e.g.:
 
 ```
 recovery: segments=3 records=10523 truncated=1 last_seqno=10523 status=OK
+recovery: memtable_keys=8712 memtable_bytes=1204233 last_seqno=10523
 ```
 
 `--config PATH` overrides the config file (default: `config/default.json`).
@@ -60,6 +62,27 @@ Missing `--key` exits with a non-zero code.
   Each segment starts with an 8-byte header: magic `LSMW`, version `1`,
   3 reserved bytes.
 
+## Memtable policies (Section 2)
+
+- **Size accounting:** approximate entry size = key length + value length +
+  `memtable_size_overhead_bytes_per_entry` (default 32).
+- **Rotation:** when the active memtable reaches `memtable_max_bytes`
+  (default 64 MiB) it is frozen into the immutable list and a fresh active
+  table is created; a flush request is queued for Section 3.
+- **Backpressure (Option A — block):** if rotation would exceed
+  `max_immutable_tables` (default 4), it prints
+  `backpressure: immutables=N (max=M); blocking writes` and refuses the write
+  with a `Backpressure` error. Since the CLI is one-shot and no flusher exists
+  yet, "blocking" surfaces as a refused write; Section 3 turns this into a
+  real wait.
+- **Recovery:** WAL replay applies the same write-path rules as live
+  mutations (including rotation), so the table set after a restart matches
+  what existed before the crash. Replay itself never blocks — it warns once
+  and defers rotation if the immutable limit is hit.
+- **Concurrency model:** single writer, many readers by design; the current
+  one-shot CLI is single-threaded, so no locks exist yet (Section 7 adds
+  scheduling).
+
 ## Layout
 
 ```
@@ -73,7 +96,8 @@ tests/                test placeholders (Section 9)
 
 ## Configuration
 
-Keys: `data_dir`, `memtable_max_bytes`, `block_size`, `bloom_false_positive`,
+Keys: `data_dir`, `memtable_max_bytes`, `max_immutable_tables`,
+`memtable_size_overhead_bytes_per_entry`, `block_size`, `bloom_false_positive`,
 `wal_fsync_every_n`, `wal_segment_roll_bytes`, `compression` (`off|snappy|lz4`),
 `log_level` (`debug|info|warn|error`).
 

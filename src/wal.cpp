@@ -97,7 +97,7 @@ struct SegmentScan {
 
 // Scan one segment record by record. Any decode/checksum failure is treated
 // as tail corruption (Section 1.10): stop at the previous good offset.
-SegmentScan scan_segment(const fs::path& path) {
+SegmentScan scan_segment(const fs::path& path, const Wal::ReplayFn& replay) {
     SegmentScan result;
 
     std::FILE* f = std::fopen(path.string().c_str(), "rb");
@@ -153,16 +153,24 @@ SegmentScan scan_segment(const fs::path& path) {
         result.records += 1;
         result.max_seqno = std::max(result.max_seqno, seqno);
         result.good_bytes += kFrameOverhead + payload_len;
+
+        if (replay) {
+            const char* body = reinterpret_cast<const char*>(buf.data()) + kMinPayload;
+            replay(type == kTypeDel,
+                   std::string_view(body, key_len),
+                   std::string_view(body + key_len, val_len),
+                   seqno);
+        }
     }
 
     std::fclose(f);
     return result;
 }
 
-WalRecoveryReport scan_all(const fs::path& dir, bool truncate) {
+WalRecoveryReport scan_all(const fs::path& dir, bool truncate, const Wal::ReplayFn& replay) {
     WalRecoveryReport report;
     for (const auto& [id, path] : list_segments(dir)) {
-        const SegmentScan scan = scan_segment(path);
+        const SegmentScan scan = scan_segment(path, replay);
         report.segments += 1;
         report.records += scan.records;
         report.last_seqno = std::max(report.last_seqno, scan.max_seqno);
@@ -221,7 +229,7 @@ Wal::~Wal() {
     }
 }
 
-WalRecoveryReport Wal::open() {
+WalRecoveryReport Wal::open(const ReplayFn& replay) {
     std::error_code ec;
     fs::create_directories(dir_, ec);
     if (ec) {
@@ -229,7 +237,7 @@ WalRecoveryReport Wal::open() {
                     "cannot create WAL dir '" + dir_.string() + "': " + ec.message());
     }
 
-    const WalRecoveryReport report = scan_all(dir_, /*truncate=*/true);
+    const WalRecoveryReport report = scan_all(dir_, /*truncate=*/true, replay);
     last_seqno_ = report.last_seqno;
     total_segments_ = report.segments;
 
@@ -358,7 +366,7 @@ WalStats Wal::stats() const {
 }
 
 WalRecoveryReport Wal::verify(const fs::path& dir) {
-    return scan_all(dir, /*truncate=*/false);
+    return scan_all(dir, /*truncate=*/false, nullptr);
 }
 
 } // namespace lsm
